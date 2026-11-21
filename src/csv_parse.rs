@@ -77,9 +77,46 @@ pub fn extract_from_masks<const N: usize>(
         return None;
     }
     let mut out = [&[][..]; N];
-    let mut start = 0usize;
 
     if quote_mask == 0 {
+        if N == 7 {
+            let c0 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c1 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c2 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c3 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c4 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c5 = comma_mask.trailing_zeros() as usize;
+            unsafe {
+                out[0] = line.get_unchecked(..c0);
+                out[1] = line.get_unchecked(c0 + 1..c1);
+                out[2] = line.get_unchecked(c1 + 1..c2);
+                out[3] = line.get_unchecked(c2 + 1..c3);
+                out[4] = line.get_unchecked(c3 + 1..c4);
+                out[5] = line.get_unchecked(c4 + 1..c5);
+                out[6] = line.get_unchecked(c5 + 1..);
+            }
+            return Some(out);
+        } else if N == 4 {
+            let c0 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c1 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c2 = comma_mask.trailing_zeros() as usize;
+            unsafe {
+                out[0] = line.get_unchecked(..c0);
+                out[1] = line.get_unchecked(c0 + 1..c1);
+                out[2] = line.get_unchecked(c1 + 1..c2);
+                out[3] = line.get_unchecked(c2 + 1..);
+            }
+            return Some(out);
+        }
+
+        let mut start = 0usize;
         for slot in &mut out[..N - 1] {
             let c = comma_mask.trailing_zeros() as usize;
             comma_mask &= comma_mask - 1;
@@ -89,6 +126,7 @@ pub fn extract_from_masks<const N: usize>(
         out[N - 1] = unsafe { line.get_unchecked(start..) };
         Some(out)
     } else {
+        let mut start = 0usize;
         for slot in &mut out[..N - 1] {
             let c = comma_mask.trailing_zeros() as usize;
             comma_mask &= comma_mask - 1;
@@ -146,25 +184,57 @@ pub unsafe fn scan_line_128(p: *const u8) -> Option<(usize, u128, u128)> {
     let v_nl = _mm256_set1_epi8(b'\n' as i8);
     let v_comma = _mm256_set1_epi8(b',' as i8);
     let v_quote = _mm256_set1_epi8(b'"' as i8);
-    let mut cm = 0u128;
-    let mut qm = 0u128;
-    let mut off = 0usize;
-    while off < 128 {
-        let chunk = _mm256_loadu_si256(p.add(off) as *const __m256i);
-        let nl = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_nl)) as u32;
-        let c = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_comma)) as u32;
-        let q = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_quote)) as u32;
-        if nl != 0 {
-            let k = nl.trailing_zeros();
-            let keep = (1u32 << k).wrapping_sub(1);
-            cm |= ((c & keep) as u128) << off;
-            qm |= ((q & keep) as u128) << off;
-            return Some((off + k as usize, cm, qm));
-        }
-        cm |= (c as u128) << off;
-        qm |= (q as u128) << off;
-        off += 32;
+
+    // Chunk 0: bytes 0..32
+    let c0 = _mm256_loadu_si256(p as *const __m256i);
+    let nl0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c0, v_nl)) as u32;
+    let cm0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c0, v_comma)) as u32;
+    let qm0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c0, v_quote)) as u32;
+    if nl0 != 0 {
+        let k = nl0.trailing_zeros();
+        let keep = (1u32 << k).wrapping_sub(1);
+        return Some((k as usize, (cm0 & keep) as u128, (qm0 & keep) as u128));
     }
+
+    // Chunk 1: bytes 32..64
+    let c1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let nl1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, v_nl)) as u32;
+    let cm1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, v_comma)) as u32;
+    let qm1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, v_quote)) as u32;
+    if nl1 != 0 {
+        let k = nl1.trailing_zeros();
+        let keep = (1u32 << k).wrapping_sub(1);
+        let cm = (cm0 as u128) | (((cm1 & keep) as u128) << 32);
+        let qm = (qm0 as u128) | (((qm1 & keep) as u128) << 32);
+        return Some((32 + k as usize, cm, qm));
+    }
+
+    // Chunk 2: bytes 64..96
+    let c2 = _mm256_loadu_si256(p.add(64) as *const __m256i);
+    let nl2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c2, v_nl)) as u32;
+    let cm2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c2, v_comma)) as u32;
+    let qm2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c2, v_quote)) as u32;
+    if nl2 != 0 {
+        let k = nl2.trailing_zeros();
+        let keep = (1u32 << k).wrapping_sub(1);
+        let cm = (cm0 as u128) | ((cm1 as u128) << 32) | (((cm2 & keep) as u128) << 64);
+        let qm = (qm0 as u128) | ((qm1 as u128) << 32) | (((qm2 & keep) as u128) << 64);
+        return Some((64 + k as usize, cm, qm));
+    }
+
+    // Chunk 3: bytes 96..128
+    let c3 = _mm256_loadu_si256(p.add(96) as *const __m256i);
+    let nl3 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c3, v_nl)) as u32;
+    let cm3 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c3, v_comma)) as u32;
+    let qm3 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(c3, v_quote)) as u32;
+    if nl3 != 0 {
+        let k = nl3.trailing_zeros();
+        let keep = (1u32 << k).wrapping_sub(1);
+        let cm = (cm0 as u128) | ((cm1 as u128) << 32) | ((cm2 as u128) << 64) | (((cm3 & keep) as u128) << 96);
+        let qm = (qm0 as u128) | ((qm1 as u128) << 32) | ((qm2 as u128) << 64) | (((qm3 & keep) as u128) << 96);
+        return Some((96 + k as usize, cm, qm));
+    }
+
     None
 }
 

@@ -125,8 +125,20 @@ impl LinkLookup {
     /// only for IDs that pass the filter, then probe.
     #[inline]
     pub fn lookup_batch(&self, uids: &[&[u8]], hs: &[u64], out: &mut [Option<u32>]) {
-        let n = uids.len();
-        debug_assert!(n <= MAX_BATCH && hs.len() == n && out.len() >= n);
+        self.lookup_batch_lazy(hs, out, |i| uids[i]);
+    }
+
+    /// Like `lookup_batch`, but fetches `uid` lazily ONLY for IDs that pass
+    /// the Bloom filter. Avoids fetching user IDs from memory on Bloom rejects.
+    #[inline]
+    pub fn lookup_batch_lazy<'a>(
+        &self,
+        hs: &[u64],
+        out: &mut [Option<u32>],
+        mut get_uid: impl FnMut(usize) -> &'a [u8],
+    ) {
+        let n = hs.len();
+        debug_assert!(n <= MAX_BATCH && out.len() >= n);
         if self.empty {
             out[..n].fill(None);
             return;
@@ -143,7 +155,12 @@ impl LinkLookup {
             }
         }
         for i in 0..n {
-            out[i] = if maybe[i] { self.probe(uids[i], hs[i]) } else { None };
+            out[i] = if maybe[i] {
+                let uid = get_uid(i);
+                self.probe(uid, hs[i])
+            } else {
+                None
+            };
         }
     }
 
@@ -183,23 +200,13 @@ impl LinkLookup {
         let mut idx = (h64 as usize) & sh.mask;
         if ulen <= 10 {
             let ulen16 = ulen as u16;
-            let mut key = [0u8; 10];
-            unsafe {
-                std::ptr::copy_nonoverlapping(uid.as_ptr(), key.as_mut_ptr(), ulen);
-            }
-            let key_lo = u64::from_ne_bytes(key[0..8].try_into().unwrap());
-            let key_hi = u16::from_ne_bytes(key[8..10].try_into().unwrap());
             loop {
                 let slot = unsafe { *sh.slots.get_unchecked(idx) };
                 if slot.comp_id == u32::MAX {
                     return None;
                 }
-                if slot.len == ulen16 {
-                    let s_lo = u64::from_ne_bytes(slot.data[0..8].try_into().unwrap());
-                    let s_hi = u16::from_ne_bytes(slot.data[8..10].try_into().unwrap());
-                    if s_lo == key_lo && s_hi == key_hi {
-                        return Some(slot.comp_id);
-                    }
+                if slot.len == ulen16 && unsafe { slot.data.get_unchecked(..ulen) } == uid {
+                    return Some(slot.comp_id);
                 }
                 idx = (idx + 1) & sh.mask;
             }

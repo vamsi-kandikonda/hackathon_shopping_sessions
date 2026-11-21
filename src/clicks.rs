@@ -15,7 +15,7 @@ use crate::lookups::Lookups;
 use crate::timestamp::{YmCache, parse_timestamp_in_window};
 
 const FLUSH: usize = 64 * 1024;
-const PREFETCH_BATCH: usize = 32;
+const PREFETCH_BATCH: usize = 64;
 
 #[derive(Default)]
 pub struct PersonClickPart {

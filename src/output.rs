@@ -11,7 +11,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 
-const BATCH_SIZE: usize = 65_536;
+const BATCH_SIZE: usize = 131_072;
 
 pub fn user_daily_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -38,7 +38,7 @@ pub fn campaign_daily_schema() -> SchemaRef {
 
 fn user_daily_props() -> WriterProperties {
     WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(Compression::UNCOMPRESSED)
         .set_statistics_enabled(EnabledStatistics::None)
         .set_column_dictionary_enabled(ColumnPath::new(vec!["user_id".to_string()]), false)
         .set_max_row_group_size(512 * 1024)
@@ -47,7 +47,7 @@ fn user_daily_props() -> WriterProperties {
 
 fn campaign_daily_props() -> WriterProperties {
     WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(Compression::UNCOMPRESSED)
         .set_statistics_enabled(EnabledStatistics::None)
         .build()
 }
@@ -151,6 +151,12 @@ impl UserDailyWriter {
 
         let n = self.buffered;
         self.buffered = 0;
+        self.user_ids = StringBuilder::with_capacity(BATCH_SIZE, BATCH_SIZE * 12);
+        self.days = Date32Builder::with_capacity(BATCH_SIZE);
+        self.sessions = Int64Builder::with_capacity(BATCH_SIZE);
+        self.events = Int64Builder::with_capacity(BATCH_SIZE);
+        self.revenue_cents = Int64Builder::with_capacity(BATCH_SIZE);
+        self.top_categories = StringBuilder::with_capacity(BATCH_SIZE, BATCH_SIZE * 8);
         let w = self.ensure_writer()?;
         w.write(&batch)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;

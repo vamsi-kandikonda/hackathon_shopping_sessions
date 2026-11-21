@@ -71,28 +71,9 @@ impl MappedFile {
     }
 
     #[inline(always)]
-    pub fn advise_dontneed(&self, start: usize, end: usize) {
-        #[cfg(target_os = "linux")]
-        {
-            if self.len > DEFAULT_CHUNK_SIZE {
-                let page = 4096usize;
-                let a_start = (start + page - 1) & !(page - 1);
-                let a_end = end & !(page - 1);
-                if a_end > a_start {
-                    unsafe {
-                        libc::madvise(
-                            (self.ptr as *mut u8).add(a_start) as *mut libc::c_void,
-                            a_end - a_start,
-                            libc::MADV_DONTNEED,
-                        );
-                    }
-                }
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (start, end);
-        }
+    pub fn advise_dontneed(&self, _start: usize, _end: usize) {
+        // Drop already calls madvise(MADV_DONTNEED) for the entire file. Calling it
+        // per 4 MB chunk spams mmap_lock and TLB flushes across all 8 cores.
     }
 }
 
@@ -384,10 +365,10 @@ pub fn for_each_record_read<'b, const N: usize>(
     }
 }
 
-/// Use `pread` instead of `mmap` for event and click input (`SS_IO=mmap` to switch back).
+/// Use `mmap` by default for event and click input (`SS_IO=pread` to switch to pread).
 pub fn use_pread() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("SS_IO").map_or(true, |v| v != "mmap"))
+    *FLAG.get_or_init(|| std::env::var("SS_IO").map_or(false, |v| v == "pread"))
 }
 
 const STREAM_BLOCK: usize = 256 * 1024;

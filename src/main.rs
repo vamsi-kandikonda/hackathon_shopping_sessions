@@ -136,11 +136,11 @@ fn pipeline<K: EvKey>(
     let parsed = parsed?;
     timer.lap("links + event parse");
 
-    // Phase 2b, then 3: run alone. Overlapping these two on 8 vCPUs costs
-    // more CPU than it hides.
+    // Phase 2b: route events with all cores.
     let mut person_events = events::route_events::<K>(parsed, &link_lookup, ncpu);
     timer.lap("event route");
-    // Clicks write into parse memory that routing no longer needs.
+
+    // Phase 3: clicks write into parse memory that routing no longer needs.
     let spare = person_events.take_spare();
     let person_clicks = clicks::process_clicks(data_dir, lookups, &link_lookup, ncpu, spare)?;
     drop(link_lookup);

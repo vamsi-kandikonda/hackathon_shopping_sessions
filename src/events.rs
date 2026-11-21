@@ -22,9 +22,29 @@ use crate::timestamp::{
 const TAG_VALID: u8 = 1;
 const TAG_PURCHASE: u8 = 2;
 
+const VIEW_U32: u32 = u32::from_ne_bytes(*b"view");
+const CART_U32: u32 = u32::from_ne_bytes(*b"cart");
+const PURCH_U64: u64 = u64::from_ne_bytes(*b"purchase");
+
+#[inline(always)]
+fn parse_etype(etype: &[u8]) -> Option<bool> {
+    if etype.len() == 4 {
+        let v = u32::from_ne_bytes(unsafe { *(etype.as_ptr() as *const [u8; 4]) });
+        if v == VIEW_U32 || v == CART_U32 {
+            return Some(false);
+        }
+    } else if etype.len() == 8 {
+        let v = u64::from_ne_bytes(unsafe { *(etype.as_ptr() as *const [u8; 8]) });
+        if v == PURCH_U64 {
+            return Some(true);
+        }
+    }
+    None
+}
+
 const PARSE_FLUSH: usize = 32 * 1024;
 const ROUTE_FLUSH: usize = 64 * 1024;
-const PREFETCH_BATCH: usize = 32;
+const PREFETCH_BATCH: usize = 64;
 
 /// One surviving event, packed so that sorting the keys sorts by timestamp.
 /// `u64` (compact) holds `ts_rel` in 32 bits, the category in 8 and the price
@@ -225,12 +245,7 @@ pub fn parse_events<K: EvKey>(
                             let mut price = 0u32;
                             let mut cat = 0u32;
                             if !uid.is_empty() && !pid.is_empty() {
-                                let kind = match etype {
-                                    b"view" | b"cart" => Some(false),
-                                    b"purchase" => Some(true),
-                                    _ => None,
-                                };
-                                if let Some(is_purchase) = kind {
+                                if let Some(is_purchase) = parse_etype(etype) {
                                     if let Some(ts) =
                                         parse_timestamp_in_window(ts_b, win_start, win_end, &ym)
                                     {
@@ -357,21 +372,21 @@ fn dedup_partition<K: EvKey>(
     est_records: usize,
     slots: &mut Vec<(u32, u32)>,
     entries: &mut Vec<Rec<K>>,
+    batch: &mut Vec<(u64, Rec<K>)>,
 ) {
     entries.clear();
     let cap = ((est_records * 10 / 7).max(64)).next_power_of_two().max(1024);
     slots.clear();
     slots.resize(cap, (0, 0));
     let mask = cap - 1;
-    let mut batch: Vec<(u64, i64, Rec<K>)> = Vec::with_capacity(PREFETCH_BATCH);
+    batch.clear();
 
-    let insert_batch = |batch: &mut Vec<(u64, i64, Rec<K>)>,
+    let insert_batch = |batch: &mut Vec<(u64, Rec<K>)>,
                         slots: &mut Vec<(u32, u32)>,
                         entries: &mut Vec<Rec<K>>| {
-        for (h, ingest_sec, rec) in batch.drain(..) {
+        for (h, rec) in batch.drain(..) {
             let tag = ((h >> 32) as u32) | 1;
             let mut idx = (h as usize) & mask;
-            let eid = rec.eid(chunks);
             loop {
                 let (stag, sidx) = unsafe { *slots.get_unchecked(idx) };
                 if stag == 0 {
@@ -381,8 +396,8 @@ fn dedup_partition<K: EvKey>(
                 }
                 if stag == tag {
                     let e = unsafe { entries.get_unchecked_mut((sidx - 1) as usize) };
-                    if e.eid_len == rec.eid_len && e.eid(chunks) == eid {
-                        if ingest_sec < e.ingest_sec(chunks) {
+                    if e.eid_len == rec.eid_len && e.eid(chunks) == rec.eid(chunks) {
+                        if rec.ingest_sec(chunks) < e.ingest_sec(chunks) {
                             *e = rec;
                         }
                         break;
@@ -403,7 +418,6 @@ fn dedup_partition<K: EvKey>(
             let eid_off = pos;
             pos += eid_len;
             let h = rd_u64(data, pos);
-            let ingest_sec = rd_u64(data, pos + 8) as i64;
             pos += 16;
 
             let valid = (tag & TAG_VALID) != 0;
@@ -430,7 +444,6 @@ fn dedup_partition<K: EvKey>(
             prefetch_read(unsafe { slots.as_ptr().add((h as usize) & mask) });
             batch.push((
                 h,
-                ingest_sec,
                 Rec {
                     key,
                     chunk_flags: (ci as u32) | ((valid as u32) << 31),
@@ -441,12 +454,12 @@ fn dedup_partition<K: EvKey>(
                 },
             ));
             if batch.len() == PREFETCH_BATCH {
-                insert_batch(&mut batch, slots, entries);
+                insert_batch(batch, slots, entries);
             }
         }
     }
     if !batch.is_empty() {
-        insert_batch(&mut batch, slots, entries);
+        insert_batch(batch, slots, entries);
     }
 }
 
@@ -476,6 +489,7 @@ pub fn route_events<K: EvKey>(
                 let mut arena = Arena::default();
                 let mut slots: Vec<(u32, u32)> = Vec::new();
                 let mut entries: Vec<Rec<K>> = Vec::new();
+                let mut batch: Vec<(u64, Rec<K>)> = Vec::with_capacity(PREFETCH_BATCH);
                 let mut loc_linked: Vec<FixedBuf> = (0..PERSON_PARTS).map(|_| FixedBuf::empty()).collect();
                 let mut loc_sing: Vec<FixedBuf> = (0..PERSON_PARTS).map(|_| FixedBuf::empty()).collect();
                 let mut n_linked = vec![0usize; PERSON_PARTS];
@@ -493,7 +507,7 @@ pub fn route_events<K: EvKey>(
                     }
                     let chunks: Vec<&[u8]> = raw.iter().map(|c| c.as_slice()).collect();
                     crate::prof::time(crate::prof::ROUTE_DEDUP, || {
-                        dedup_partition::<K>(&chunks, counts[ep], &mut slots, &mut entries)
+                        dedup_partition::<K>(&chunks, counts[ep], &mut slots, &mut entries, &mut batch)
                     });
                     let _scatter = crate::prof::Span::new(crate::prof::ROUTE_SCATTER);
                     let n = entries.len();
