@@ -1,0 +1,13 @@
+# Profiling image: same build with symbols, plus Linux perf. Not used for scoring.
+# docker buildx build --platform linux/arm64 -f scripts/Dockerfile.prof --load -t shopping-sessions:prof .
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+ENV CARGO_PROFILE_RELEASE_STRIP=none CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+RUN cargo build --release --locked
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends linux-perf binutils && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/shopping-sessions /app/shopping-sessions
+WORKDIR /app
