@@ -128,12 +128,6 @@ pub fn read_varint(data: &[u8], pos: &mut usize) -> usize {
 }
 
 #[inline(always)]
-pub fn rd_u16(data: &[u8], pos: usize) -> u16 {
-    debug_assert!(pos + 2 <= data.len());
-    u16::from_le(unsafe { (data.as_ptr().add(pos) as *const u16).read_unaligned() })
-}
-
-#[inline(always)]
 pub fn rd_u32(data: &[u8], pos: usize) -> u32 {
     debug_assert!(pos + 4 <= data.len());
     u32::from_le(unsafe { (data.as_ptr().add(pos) as *const u32).read_unaligned() })
@@ -181,14 +175,6 @@ impl Cur {
         unsafe {
             *self.p = v;
             self.p = self.p.add(1);
-        }
-    }
-
-    #[inline(always)]
-    pub fn u16(&mut self, v: u16) {
-        unsafe {
-            (self.p as *mut u16).write_unaligned(v.to_le());
-            self.p = self.p.add(2);
         }
     }
 

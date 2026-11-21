@@ -36,33 +36,28 @@ unsafe impl Send for MappedFile {}
 unsafe impl Sync for MappedFile {}
 
 impl MappedFile {
-    fn open_inner(path: &Path, do_mmap: bool) -> io::Result<Option<Self>> {
+    pub fn open(path: &Path) -> io::Result<Option<Self>> {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
         if len == 0 {
             return Ok(None);
         }
-        let ptr = if do_mmap {
-            let p = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    len,
-                    libc::PROT_READ,
-                    libc::MAP_PRIVATE,
-                    file.as_raw_fd(),
-                    0,
-                )
-            };
-            if p == libc::MAP_FAILED {
-                return Err(io::Error::last_os_error());
-            }
-            unsafe {
-                libc::madvise(p, len, libc::MADV_SEQUENTIAL);
-            }
-            p
-        } else {
-            std::ptr::null_mut()
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
         };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe {
+            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
+        }
         #[cfg(target_os = "linux")]
         unsafe {
             libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
@@ -127,46 +122,24 @@ pub fn plan_chunks(
     files: &[PathBuf],
     chunk_size: usize,
 ) -> io::Result<(Vec<MappedFile>, Vec<FileChunk>, u64)> {
-    plan_chunks_inner(files, chunk_size, true)
-}
-
-pub fn plan_chunks_for_read(
-    files: &[PathBuf],
-    chunk_size: usize,
-) -> io::Result<(Vec<MappedFile>, Vec<FileChunk>, u64)> {
-    plan_chunks_inner(files, chunk_size, !use_pread())
-}
-
-fn plan_chunks_inner(
-    files: &[PathBuf],
-    chunk_size: usize,
-    do_mmap: bool,
-) -> io::Result<(Vec<MappedFile>, Vec<FileChunk>, u64)> {
-    use std::os::unix::fs::FileExt;
     let mut mapped = Vec::with_capacity(files.len());
     let mut chunks = Vec::new();
     let mut total_bytes = 0u64;
-    let mut hdr_buf = [0u8; 4096];
 
     for path in files {
-        let Some(mf) = MappedFile::open_inner(path, do_mmap)? else {
+        let Some(mf) = MappedFile::open(path)? else {
             continue;
         };
-        let file_len = mf.len;
-        let nl = if !mf.ptr.is_null() {
-            memchr(b'\n', mf.as_slice())
-        } else {
-            let n = mf.file.read_at(&mut hdr_buf, 0)?;
-            memchr(b'\n', &hdr_buf[..n])
-        };
-        let Some(nl) = nl else {
+        let bytes = mf.as_slice();
+        let Some(nl) = memchr(b'\n', bytes) else {
             continue;
         };
         let data_start = nl + 1;
-        if data_start >= file_len {
+        if data_start >= bytes.len() {
             continue;
         }
         let file_idx = mapped.len();
+        let file_len = bytes.len();
         total_bytes += (file_len - data_start) as u64;
         mapped.push(mf);
 
