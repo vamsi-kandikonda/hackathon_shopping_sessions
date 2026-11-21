@@ -1,0 +1,9 @@
+target/
+.local/
+fixtures/
+dev/
+out/
+dev-answer/
+docs/
+*.md
+.git
