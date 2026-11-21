@@ -68,6 +68,27 @@ fn split_fields_scalar<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
 }
 
 #[inline(always)]
+unsafe fn extract_field_quoted<'a>(line: &'a [u8], start: usize, end: usize, quote_mask: u128) -> Option<&'a [u8]> {
+    let flen = end - start;
+    if flen == 0 {
+        return Some(&[]);
+    }
+    let fmask = if flen >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << flen) - 1
+    };
+    let fq = (quote_mask >> start) & fmask;
+    if fq == 0 {
+        Some(line.get_unchecked(start..end))
+    } else if flen >= 2 && fq == (1u128 | (1u128 << (flen - 1))) {
+        Some(line.get_unchecked(start + 1..end - 1))
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
 pub fn extract_from_masks<const N: usize>(
     line: &[u8],
     mut comma_mask: u128,
@@ -126,49 +147,52 @@ pub fn extract_from_masks<const N: usize>(
         out[N - 1] = unsafe { line.get_unchecked(start..) };
         Some(out)
     } else {
+        if N == 7 {
+            let c0 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c1 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c2 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c3 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c4 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c5 = comma_mask.trailing_zeros() as usize;
+            unsafe {
+                out[0] = extract_field_quoted(line, 0, c0, quote_mask)?;
+                out[1] = extract_field_quoted(line, c0 + 1, c1, quote_mask)?;
+                out[2] = extract_field_quoted(line, c1 + 1, c2, quote_mask)?;
+                out[3] = extract_field_quoted(line, c2 + 1, c3, quote_mask)?;
+                out[4] = extract_field_quoted(line, c3 + 1, c4, quote_mask)?;
+                out[5] = extract_field_quoted(line, c4 + 1, c5, quote_mask)?;
+                out[6] = extract_field_quoted(line, c5 + 1, line.len(), quote_mask)?;
+            }
+            return Some(out);
+        } else if N == 4 {
+            let c0 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c1 = comma_mask.trailing_zeros() as usize;
+            comma_mask &= comma_mask - 1;
+            let c2 = comma_mask.trailing_zeros() as usize;
+            unsafe {
+                out[0] = extract_field_quoted(line, 0, c0, quote_mask)?;
+                out[1] = extract_field_quoted(line, c0 + 1, c1, quote_mask)?;
+                out[2] = extract_field_quoted(line, c1 + 1, c2, quote_mask)?;
+                out[3] = extract_field_quoted(line, c2 + 1, line.len(), quote_mask)?;
+            }
+            return Some(out);
+        }
+
         let mut start = 0usize;
         for slot in &mut out[..N - 1] {
             let c = comma_mask.trailing_zeros() as usize;
             comma_mask &= comma_mask - 1;
-            let flen = c - start;
-            if flen == 0 {
-                *slot = &[];
-            } else {
-                let fmask = if flen == 128 {
-                    u128::MAX
-                } else {
-                    (1u128 << flen) - 1
-                };
-                let fq = (quote_mask >> start) & fmask;
-                if fq == 0 {
-                    *slot = unsafe { line.get_unchecked(start..c) };
-                } else if flen >= 2 && fq == (1u128 | (1u128 << (flen - 1))) {
-                    *slot = unsafe { line.get_unchecked(start + 1..c - 1) };
-                } else {
-                    return None;
-                }
-            }
+            *slot = unsafe { extract_field_quoted(line, start, c, quote_mask)? };
             start = c + 1;
         }
         let end = line.len();
-        let flen = end - start;
-        if flen == 0 {
-            out[N - 1] = &[];
-        } else {
-            let fmask = if flen == 128 {
-                u128::MAX
-            } else {
-                (1u128 << flen) - 1
-            };
-            let fq = (quote_mask >> start) & fmask;
-            if fq == 0 {
-                out[N - 1] = unsafe { line.get_unchecked(start..end) };
-            } else if flen >= 2 && fq == (1u128 | (1u128 << (flen - 1))) {
-                out[N - 1] = unsafe { line.get_unchecked(start + 1..end - 1) };
-            } else {
-                return None;
-            }
-        }
+        out[N - 1] = unsafe { extract_field_quoted(line, start, end, quote_mask)? };
         Some(out)
     }
 }
@@ -247,30 +271,111 @@ pub unsafe fn scan_line_128(p: *const u8) -> Option<(usize, u128, u128)> {
         let m = vandq_u8(v, bits);
         (vaddv_u8(vget_low_u8(m)) as u32) | ((vaddv_u8(vget_high_u8(m)) as u32) << 8)
     }
+    #[inline(always)]
+    unsafe fn movemask32(v0: uint8x16_t, v1: uint8x16_t, bits: uint8x16_t) -> u32 {
+        movemask(v0, bits) | (movemask(v1, bits) << 16)
+    }
+
     let bits_arr: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
     let bits = vld1q_u8(bits_arr.as_ptr());
     let v_nl = vdupq_n_u8(b'\n');
     let v_comma = vdupq_n_u8(b',');
     let v_quote = vdupq_n_u8(b'"');
-    let mut cm = 0u128;
-    let mut qm = 0u128;
-    let mut off = 0usize;
-    while off < 128 {
-        let chunk = vld1q_u8(p.add(off));
-        let nlv = vceqq_u8(chunk, v_nl);
-        let c = movemask(vceqq_u8(chunk, v_comma), bits);
-        let q = movemask(vceqq_u8(chunk, v_quote), bits);
-        if vmaxvq_u8(nlv) != 0 {
-            let k = movemask(nlv, bits).trailing_zeros();
-            let keep = (1u32 << k).wrapping_sub(1);
-            cm |= ((c & keep) as u128) << off;
-            qm |= ((q & keep) as u128) << off;
-            return Some((off + k as usize, cm, qm));
-        }
-        cm |= (c as u128) << off;
-        qm |= (q as u128) << off;
-        off += 16;
+
+    // Chunk 0: bytes 0..32
+    let c0a = vld1q_u8(p);
+    let c0b = vld1q_u8(p.add(16));
+    let nl0a = vceqq_u8(c0a, v_nl);
+    let nl0b = vceqq_u8(c0b, v_nl);
+    let cv0a = vceqq_u8(c0a, v_comma);
+    let cv0b = vceqq_u8(c0b, v_comma);
+    let qv0a = vceqq_u8(c0a, v_quote);
+    let qv0b = vceqq_u8(c0b, v_quote);
+    let cm0 = movemask32(cv0a, cv0b, bits);
+    let qm0 = if vmaxvq_u8(vorrq_u8(qv0a, qv0b)) != 0 {
+        movemask32(qv0a, qv0b, bits)
+    } else {
+        0
+    };
+    if vmaxvq_u8(vorrq_u8(nl0a, nl0b)) != 0 {
+        let nl0 = movemask32(nl0a, nl0b, bits);
+        let k = nl0.trailing_zeros();
+        let keep = (1u32 << k).wrapping_sub(1);
+        return Some((k as usize, (cm0 & keep) as u128, (qm0 & keep) as u128));
     }
+
+    // Chunk 1: bytes 32..64
+    let c1a = vld1q_u8(p.add(32));
+    let c1b = vld1q_u8(p.add(48));
+    let nl1a = vceqq_u8(c1a, v_nl);
+    let nl1b = vceqq_u8(c1b, v_nl);
+    let cv1a = vceqq_u8(c1a, v_comma);
+    let cv1b = vceqq_u8(c1b, v_comma);
+    let qv1a = vceqq_u8(c1a, v_quote);
+    let qv1b = vceqq_u8(c1b, v_quote);
+    let cm1 = movemask32(cv1a, cv1b, bits);
+    let qm1 = if vmaxvq_u8(vorrq_u8(qv1a, qv1b)) != 0 {
+        movemask32(qv1a, qv1b, bits)
+    } else {
+        0
+    };
+    if vmaxvq_u8(vorrq_u8(nl1a, nl1b)) != 0 {
+        let nl1 = movemask32(nl1a, nl1b, bits);
+        let k = nl1.trailing_zeros();
+        let keep = (1u32 << k).wrapping_sub(1);
+        let cm = (cm0 as u128) | (((cm1 & keep) as u128) << 32);
+        let qm = (qm0 as u128) | (((qm1 & keep) as u128) << 32);
+        return Some((32 + k as usize, cm, qm));
+    }
+
+    // Chunk 2: bytes 64..96
+    let c2a = vld1q_u8(p.add(64));
+    let c2b = vld1q_u8(p.add(80));
+    let nl2a = vceqq_u8(c2a, v_nl);
+    let nl2b = vceqq_u8(c2b, v_nl);
+    let cv2a = vceqq_u8(c2a, v_comma);
+    let cv2b = vceqq_u8(c2b, v_comma);
+    let qv2a = vceqq_u8(c2a, v_quote);
+    let qv2b = vceqq_u8(c2b, v_quote);
+    let cm2 = movemask32(cv2a, cv2b, bits);
+    let qm2 = if vmaxvq_u8(vorrq_u8(qv2a, qv2b)) != 0 {
+        movemask32(qv2a, qv2b, bits)
+    } else {
+        0
+    };
+    if vmaxvq_u8(vorrq_u8(nl2a, nl2b)) != 0 {
+        let nl2 = movemask32(nl2a, nl2b, bits);
+        let k = nl2.trailing_zeros();
+        let keep = (1u32 << k).wrapping_sub(1);
+        let cm = (cm0 as u128) | ((cm1 as u128) << 32) | (((cm2 & keep) as u128) << 64);
+        let qm = (qm0 as u128) | ((qm1 as u128) << 32) | (((qm2 & keep) as u128) << 64);
+        return Some((64 + k as usize, cm, qm));
+    }
+
+    // Chunk 3: bytes 96..128
+    let c3a = vld1q_u8(p.add(96));
+    let c3b = vld1q_u8(p.add(112));
+    let nl3a = vceqq_u8(c3a, v_nl);
+    let nl3b = vceqq_u8(c3b, v_nl);
+    let cv3a = vceqq_u8(c3a, v_comma);
+    let cv3b = vceqq_u8(c3b, v_comma);
+    let qv3a = vceqq_u8(c3a, v_quote);
+    let qv3b = vceqq_u8(c3b, v_quote);
+    let cm3 = movemask32(cv3a, cv3b, bits);
+    let qm3 = if vmaxvq_u8(vorrq_u8(qv3a, qv3b)) != 0 {
+        movemask32(qv3a, qv3b, bits)
+    } else {
+        0
+    };
+    if vmaxvq_u8(vorrq_u8(nl3a, nl3b)) != 0 {
+        let nl3 = movemask32(nl3a, nl3b, bits);
+        let k = nl3.trailing_zeros();
+        let keep = (1u32 << k).wrapping_sub(1);
+        let cm = (cm0 as u128) | ((cm1 as u128) << 32) | ((cm2 as u128) << 64) | (((cm3 & keep) as u128) << 96);
+        let qm = (qm0 as u128) | ((qm1 as u128) << 32) | ((qm2 as u128) << 64) | (((qm3 & keep) as u128) << 96);
+        return Some((96 + k as usize, cm, qm));
+    }
+
     None
 }
 

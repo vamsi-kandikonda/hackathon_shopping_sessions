@@ -109,7 +109,13 @@ impl YmCache {
     #[inline(always)]
     fn lookup(&self, b: &[u8]) -> Option<YmEntry> {
         let key = u64::from_ne_bytes(unsafe { *(b.as_ptr() as *const [u8; 8]) });
-        for i in 0..self.len {
+        if self.len > 0 {
+            let e0 = unsafe { *self.entries.get_unchecked(0) };
+            if e0.ym_u64 == key {
+                return Some(e0);
+            }
+        }
+        for i in 1..self.len {
             let e = unsafe { *self.entries.get_unchecked(i) };
             if e.ym_u64 == key {
                 return Some(e);
@@ -175,45 +181,109 @@ fn parse_civil_19_sec_slow(b: &[u8]) -> Option<i64> {
 }
 
 #[inline(always)]
+pub fn parse_civil_19_sec_with_entry(b: &[u8], entry: &YmEntry) -> Option<i64> {
+    parse_civil_19_sec_with_entry_and_day(b, entry).map(|(s, _)| s)
+}
+
+#[inline(always)]
+pub fn parse_civil_19_sec_with_entry_and_day(b: &[u8], entry: &YmEntry) -> Option<(i64, i64)> {
+    let w0 = u64::from_le_bytes(unsafe { *(b.as_ptr().add(8) as *const [u8; 8]) });
+    let w1 = u32::from_le_bytes(unsafe { *(b.as_ptr().add(16) as *const [u8; 4]) });
+
+    let d0 = (w0 as u8).wrapping_sub(b'0');
+    let d1 = ((w0 >> 8) as u8).wrapping_sub(b'0');
+    let sep_t = ((w0 >> 16) as u8) ^ b'T';
+    let h0 = ((w0 >> 24) as u8).wrapping_sub(b'0');
+    let h1 = ((w0 >> 32) as u8).wrapping_sub(b'0');
+    let sep_c0 = ((w0 >> 40) as u8) ^ b':';
+    let m0 = ((w0 >> 48) as u8).wrapping_sub(b'0');
+    let m1 = ((w0 >> 56) as u8).wrapping_sub(b'0');
+
+    let sep_c1 = (w1 as u8) ^ b':';
+    let s0 = ((w1 >> 8) as u8).wrapping_sub(b'0');
+    let s1 = ((w1 >> 16) as u8).wrapping_sub(b'0');
+
+    let sep_bad = (sep_t as u32) | (sep_c0 as u32) | (sep_c1 as u32);
+    if (sep_bad != 0)
+        | (d0 > 9)
+        | (d1 > 9)
+        | (h0 > 9)
+        | (h1 > 9)
+        | (m0 > 9)
+        | (m1 > 9)
+        | (s0 > 9)
+        | (s1 > 9)
+    {
+        return None;
+    }
+    let day = (d0 as u32) * 10 + (d1 as u32);
+    let hour = (h0 as u32) * 10 + (h1 as u32);
+    let minute = (m0 as u32) * 10 + (m1 as u32);
+    let second = (s0 as u32) * 10 + (s1 as u32);
+    if (day < 1) | (day > entry.max_day) | (hour > 23) | (minute > 59) | (second > 59) {
+        return None;
+    }
+    let day_start = entry.day1_sec + ((day - 1) as i64) * 86_400;
+    let tod = (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64);
+    Some((day_start + tod, day_start))
+}
+
+#[inline(always)]
+pub fn parse_time_of_day_sec(b: &[u8]) -> Option<u32> {
+    if b.len() != 20 || unsafe { *b.get_unchecked(10) } != b'T' || unsafe { *b.get_unchecked(19) } != b'Z' {
+        return None;
+    }
+    let w0 = u64::from_le_bytes(unsafe { *(b.as_ptr().add(11) as *const [u8; 8]) });
+    let h0 = (w0 as u8).wrapping_sub(b'0');
+    let h1 = ((w0 >> 8) as u8).wrapping_sub(b'0');
+    let sep_c0 = ((w0 >> 16) as u8) ^ b':';
+    let m0 = ((w0 >> 24) as u8).wrapping_sub(b'0');
+    let m1 = ((w0 >> 32) as u8).wrapping_sub(b'0');
+    let sep_c1 = ((w0 >> 40) as u8) ^ b':';
+    let s0 = ((w0 >> 48) as u8).wrapping_sub(b'0');
+    let s1 = ((w0 >> 56) as u8).wrapping_sub(b'0');
+
+    let sep_bad = (sep_c0 as u32) | (sep_c1 as u32);
+    if (sep_bad != 0)
+        | (h0 > 9)
+        | (h1 > 9)
+        | (m0 > 9)
+        | (m1 > 9)
+        | (s0 > 9)
+        | (s1 > 9)
+    {
+        return None;
+    }
+    let hour = (h0 as u32) * 10 + (h1 as u32);
+    let minute = (m0 as u32) * 10 + (m1 as u32);
+    let second = (s0 as u32) * 10 + (s1 as u32);
+    if (hour > 23) | (minute > 59) | (second > 59) {
+        return None;
+    }
+    Some(hour * 3600 + minute * 60 + second)
+}
+
+#[inline(always)]
 fn parse_civil_19_sec_fast(b: &[u8], ym_cache: &YmCache) -> Option<i64> {
     if let Some(entry) = ym_cache.lookup(b) {
-        let sep_bad = (b[10] ^ b'T') | (b[13] ^ b':') | (b[16] ^ b':');
-        let d0 = b[8].wrapping_sub(b'0');
-        let d1 = b[9].wrapping_sub(b'0');
-        let h0 = b[11].wrapping_sub(b'0');
-        let h1 = b[12].wrapping_sub(b'0');
-        let m0 = b[14].wrapping_sub(b'0');
-        let m1 = b[15].wrapping_sub(b'0');
-        let s0 = b[17].wrapping_sub(b'0');
-        let s1 = b[18].wrapping_sub(b'0');
-        if (sep_bad != 0)
-            | (d0 > 9)
-            | (d1 > 9)
-            | (h0 > 9)
-            | (h1 > 9)
-            | (m0 > 9)
-            | (m1 > 9)
-            | (s0 > 9)
-            | (s1 > 9)
-        {
-            return None;
-        }
-        let day = (d0 as u32) * 10 + (d1 as u32);
-        let hour = (h0 as u32) * 10 + (h1 as u32);
-        let minute = (m0 as u32) * 10 + (m1 as u32);
-        let second = (s0 as u32) * 10 + (s1 as u32);
-        if (day < 1) | (day > entry.max_day) | (hour > 23) | (minute > 59) | (second > 59) {
-            return None;
-        }
-        return Some(
-            entry.day1_sec
-                + ((day - 1) as i64) * 86_400
-                + (hour as i64) * 3600
-                + (minute as i64) * 60
-                + (second as i64),
-        );
+        return parse_civil_19_sec_with_entry(b, &entry);
     }
     parse_civil_19_sec_slow(b)
+}
+
+#[inline(always)]
+pub fn parse_f1_sec_fast_entry(b: &[u8], ym_cache: &YmCache) -> Option<(i64, YmEntry, i64)> {
+    if b.len() != 20 || b[19] != b'Z' {
+        return None;
+    }
+    if let Some(entry) = ym_cache.lookup(b) {
+        parse_civil_19_sec_with_entry_and_day(b, &entry).map(|(sec, day_start)| (sec, entry, day_start))
+    } else {
+        parse_civil_19_sec_slow(b).map(|sec| {
+            let day_start = (sec.div_euclid(86_400)) * 86_400;
+            (sec, YmEntry { ym_u64: 0, day1_sec: 0, max_day: 0 }, day_start)
+        })
+    }
 }
 
 /// Strict F1 parser (`YYYY-MM-DDTHH:MM:SSZ`) returning Unix seconds (no cache, used for manifest).

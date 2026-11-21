@@ -4,7 +4,7 @@
 
 use std::ptr;
 
-const REGION: usize = 32 << 20;
+const REGION: usize = 64 << 20;
 
 pub struct Arena {
     regions: Vec<(*mut u8, usize)>,
@@ -44,13 +44,7 @@ fn map_region(len: usize) -> *mut u8 {
         }
         #[cfg(target_os = "linux")]
         {
-            const MADV_POPULATE_WRITE: libc::c_int = 23;
-            let a = libc::madvise(p, len, libc::MADV_HUGEPAGE);
-            // Kernels before 5.14 return EINVAL; pages then fault in on first touch.
-            let b = libc::madvise(p, len, MADV_POPULATE_WRITE);
-            if (a != 0 || b != 0) && std::env::var_os("SS_TIMING").is_some() {
-                eprintln!("arena madvise: hugepage={a} populate={b} err={}", std::io::Error::last_os_error());
-            }
+            libc::madvise(p, len, libc::MADV_HUGEPAGE);
         }
         p as *mut u8
     }
@@ -74,6 +68,7 @@ impl Arena {
 
     /// Hand a dead chunk's memory to this arena for reuse. The caller
     /// guarantees nothing reads the chunk again and its owner stays alive.
+    #[allow(dead_code)]
     pub fn recycle(&mut self, c: RawChunk) {
         if c.len >= 1024 {
             self.free.push((c.ptr as *mut u8, c.len));

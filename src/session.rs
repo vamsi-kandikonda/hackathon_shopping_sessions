@@ -9,7 +9,7 @@ use hashbrown::{HashMap, HashTable};
 
 use crate::clicks::{PersonClickPart, PersonClicks};
 use crate::events::{EvKey, PersonEvents, PersonPart};
-use crate::hash::{PERSON_PARTS, fast_build_hasher, rd_u32, rd_u64, read_varint};
+use crate::hash::{PERSON_PARTS, fast_build_hasher};
 use crate::links::CanonNames;
 use crate::lookups::Lookups;
 use crate::output::{CampaignDailyRow, UserDailyWriter, write_campaign_daily, write_empty_user_daily};
@@ -146,15 +146,14 @@ impl CampaignAcc {
 struct ClickRef {
     ts_ms: i64,
     camp_idx: u32,
-    chunk_idx: u32,
-    cid_off: u32,
-    cid_len: u32,
+    cid_len: u8,
+    cid_bytes: [u8; 16],
 }
 
 impl ClickRef {
     #[inline(always)]
-    fn cid<'a>(&self, chunks: &'a [&'a [u8]]) -> &'a [u8] {
-        &chunks[self.chunk_idx as usize][self.cid_off as usize..(self.cid_off + self.cid_len) as usize]
+    fn cid(&self) -> &[u8] {
+        &self.cid_bytes[..self.cid_len as usize]
     }
 }
 
@@ -198,7 +197,7 @@ impl WorkerScratch {
 
 /// Sort clicks by `(ts ASC, click_id DESC)` and drop repeated `click_id`s, so the
 /// last click at or before a session start is the one that gets the credit.
-fn sort_and_dedup_clicks(clks: &mut [ClickRef], chunks: &[&[u8]]) -> usize {
+fn sort_and_dedup_clicks(clks: &mut [ClickRef]) -> usize {
     let n = clks.len();
     if n <= 1 {
         return n;
@@ -208,8 +207,8 @@ fn sort_and_dedup_clicks(clks: &mut [ClickRef], chunks: &[&[u8]]) -> usize {
             clks.swap(0, 1);
         }
         if clks[0].ts_ms == clks[1].ts_ms {
-            let c0 = clks[0].cid(chunks);
-            let c1 = clks[1].cid(chunks);
+            let c0 = clks[0].cid();
+            let c1 = clks[1].cid();
             if c0 < c1 {
                 clks.swap(0, 1);
             } else if c0 == c1 {
@@ -231,11 +230,11 @@ fn sort_and_dedup_clicks(clks: &mut [ClickRef], chunks: &[&[u8]]) -> usize {
             clks[write] = clks[i];
             write += 1;
         } else {
-            clks[i..j].sort_unstable_by(|a, b| b.cid(chunks).cmp(a.cid(chunks)));
+            clks[i..j].sort_unstable_by(|a, b| b.cid().cmp(a.cid()));
             clks[write] = clks[i];
             write += 1;
             for k in (i + 1)..j {
-                if clks[k].cid(chunks) != clks[k - 1].cid(chunks) {
+                if clks[k].cid() != clks[k - 1].cid() {
                     clks[write] = clks[k];
                     write += 1;
                 }
@@ -377,16 +376,56 @@ fn process_person<K: EvKey>(
     name: &[u8],
     evs: &mut [K],
     clks: &mut [ClickRef],
-    click_chunks: &[&[u8]],
     lookups: &Lookups,
     scratch: &mut WorkerScratch,
     acc: &mut CampaignAcc,
     writer: &mut UserDailyWriter,
 ) -> io::Result<()> {
     let n = evs.len();
+    if n == 0 {
+        return Ok(());
+    }
+    if n == 1 {
+        let k = evs[0];
+        let start_rel = k.ts_rel();
+        let sess_day = if lookups.compact_mode {
+            lookups.window_start_day + (start_rel / (MS_PER_DAY as u64)) as i32
+        } else {
+            (lookups.window_start_ms + start_rel as i64).div_euclid(MS_PER_DAY) as i32
+        };
+        let price = k.price();
+        let clk_len = sort_and_dedup_clicks(clks);
+        let has_purchase = price != 0;
+        let sess_rev = price as i64;
+        let top = if has_purchase {
+            let cat = k.cat() as usize;
+            Some(lookups.categories[cat].as_str())
+        } else {
+            None
+        };
+        let organic = lookups.organic_idx as usize;
+        if clk_len == 0 {
+            acc.add_credit(organic, sess_day, has_purchase, sess_rev);
+        } else {
+            let start_ms = lookups.window_start_ms + start_rel as i64;
+            let mut left = 0usize;
+            let mut right = 0usize;
+            attribute(
+                &clks[..clk_len], clk_len > HEAVY_CLICKS, &mut left, &mut right, start_ms, sess_day,
+                has_purchase, sess_rev, organic, scratch, acc,
+            );
+        }
+        return writer.push(
+            name,
+            lookups.all_ids_utf8,
+            sess_day,
+            1,
+            1,
+            sess_rev,
+            top,
+        );
+    }
     match n {
-        0 => return Ok(()),
-        1 => {}
         2 => {
             if evs[1] < evs[0] {
                 evs.swap(0, 1);
@@ -412,7 +451,7 @@ fn process_person<K: EvKey>(
         }
         _ => evs.sort_unstable(),
     }
-    let clk_len = sort_and_dedup_clicks(clks, click_chunks);
+    let clk_len = sort_and_dedup_clicks(clks);
     let clks = &clks[..clk_len];
     let heavy = clk_len > HEAVY_CLICKS;
     let win_start = lookups.window_start_ms;
@@ -527,100 +566,13 @@ fn build_csr<T: Copy>(
     }
 }
 
-/// Decode click chunks, keeping the clicks whose owner maps to a local person.
-/// `linked` chunks start with a `comp_id`; singleton chunks with the user ID.
-fn gather_clicks(
-    chunks: &[&[u8]],
-    expected: usize,
-    linked: bool,
-    out: &mut Vec<(u32, ClickRef)>,
-    mut local_of: impl FnMut(u32, &[u8], u64) -> Option<u32>,
-) {
-    out.clear();
-    out.reserve(expected);
-    for (ci, data) in chunks.iter().enumerate() {
-        let data: &[u8] = data;
-        let mut pos = 0usize;
-        while pos < data.len() {
-            let local = if linked {
-                let comp = rd_u32(data, pos);
-                pos += 4;
-                local_of(comp, &[], 0)
-            } else {
-                let h = rd_u64(data, pos);
-                pos += 8;
-                let ulen = read_varint(data, &mut pos);
-                let uid = &data[pos..pos + ulen];
-                pos += ulen;
-                local_of(0, uid, h)
-            };
-            let ts_ms = rd_u64(data, pos) as i64;
-            let camp_idx = rd_u32(data, pos + 8);
-            pos += 12;
-            let cid_len = read_varint(data, &mut pos);
-            let cid_off = pos;
-            pos += cid_len;
-            if let Some(l) = local {
-                out.push((
-                    l,
-                    ClickRef {
-                        ts_ms,
-                        camp_idx,
-                        chunk_idx: ci as u32,
-                        cid_off: cid_off as u32,
-                        cid_len: cid_len as u32,
-                    },
-                ));
-            }
-        }
-    }
-}
-
-/// Second grouping pass: walk the chunks again in the same order and drop
-/// each event's key into its person's slot. `read` decodes one record at
-/// `pos` and returns the key and the next position.
-fn place_keys<K: EvKey>(
-    chunks: &[crate::arena::RawChunk],
-    lids: &[u32],
-    counts: &[u32],
-    offsets: &mut Vec<usize>,
-    cursor: &mut Vec<u32>,
-    keys: &mut Vec<K>,
-    read: impl Fn(&[u8], usize) -> (K, usize),
-) {
-    let people = counts.len();
-    offsets.clear();
-    offsets.reserve(people + 1);
-    offsets.push(0);
-    for p in 0..people {
-        offsets.push(offsets[p] + counts[p] as usize);
-    }
-    cursor.clear();
-    cursor.extend(offsets[..people].iter().map(|&o| o as u32));
-    keys.clear();
-    keys.resize(lids.len(), K::pack(0, 0, 0));
-    let mut k = 0usize;
-    for chunk in chunks {
-        let data = chunk.as_slice();
-        let mut pos = 0usize;
-        while pos < data.len() {
-            let (key, next) = read(data, pos);
-            pos = next;
-            let c = unsafe { cursor.get_unchecked_mut(*lids.get_unchecked(k) as usize) };
-            unsafe { *keys.get_unchecked_mut(*c as usize) = key };
-            *c += 1;
-            k += 1;
-        }
-    }
-    debug_assert_eq!(k, lids.len());
-}
-
 struct PartitionScratch<K: EvKey> {
     comp_ids: Vec<u32>,
     counts: Vec<u32>,
     lids: Vec<u32>,
     uid_h: Vec<u64>,
-    uid_ptrs: Vec<(*const u8, u32)>,
+    uid_bytes: Vec<[u8; 16]>,
+    uid_len: Vec<u8>,
     table: HashTable<u32>,
     clicks: Vec<(u32, ClickRef)>,
     ck_out: Vec<ClickRef>,
@@ -634,19 +586,20 @@ struct PartitionScratch<K: EvKey> {
 impl<K: EvKey> PartitionScratch<K> {
     fn new() -> Self {
         Self {
-            comp_ids: Vec::with_capacity(4096),
-            counts: Vec::with_capacity(4096),
-            lids: Vec::with_capacity(32768),
-            uid_h: Vec::with_capacity(4096),
-            uid_ptrs: Vec::with_capacity(4096),
-            table: HashTable::with_capacity(4096),
-            clicks: Vec::with_capacity(8192),
-            ck_out: Vec::with_capacity(8192),
-            offsets: Vec::with_capacity(4096),
-            ck_offsets: Vec::with_capacity(4096),
-            cursor: Vec::with_capacity(4096),
-            csr_cursor: Vec::with_capacity(4096),
-            keys: Vec::with_capacity(32768),
+            comp_ids: Vec::with_capacity(8192),
+            counts: Vec::with_capacity(8192),
+            lids: Vec::with_capacity(524_288),
+            uid_h: Vec::with_capacity(8192),
+            uid_bytes: Vec::with_capacity(8192),
+            uid_len: Vec::with_capacity(8192),
+            table: HashTable::with_capacity(8192),
+            clicks: Vec::with_capacity(16384),
+            ck_out: Vec::with_capacity(16384),
+            offsets: Vec::with_capacity(8192),
+            ck_offsets: Vec::with_capacity(8192),
+            cursor: Vec::with_capacity(8192),
+            csr_cursor: Vec::with_capacity(8192),
+            keys: Vec::with_capacity(524_288),
         }
     }
 }
@@ -665,51 +618,64 @@ fn run_partition<K: EvKey>(
     acc: &mut CampaignAcc,
     writer: &mut UserDailyWriter,
 ) -> io::Result<()> {
-    // Linked people, keyed by component ID through a dense per-thread array.
-    if ev.linked_count > 0 {
+    let total_linked = ev.linked.len();
+    if total_linked > 0 {
         let group = crate::prof::Span::new(crate::prof::SESS_GROUP);
         let comp_local = &mut scratch.comp_local;
         ps.comp_ids.clear();
         ps.counts.clear();
         ps.lids.clear();
-        ps.lids.reserve(ev.linked_count);
+        ps.lids.reserve(total_linked);
 
-        let rec = 4 + K::BYTES;
-        for chunk in &ev.linked {
-            let data = chunk.as_slice();
-            let mut pos = 0usize;
-            while pos < data.len() {
-                let comp = rd_u32(data, pos);
-                pos += rec;
-                let slot = &mut comp_local[comp as usize];
-                if *slot == u32::MAX {
-                    *slot = ps.comp_ids.len() as u32;
-                    ps.comp_ids.push(comp);
-                    ps.counts.push(0);
-                }
-                ps.counts[*slot as usize] += 1;
-                ps.lids.push(*slot);
+        for r in &ev.linked {
+            let comp = r.comp;
+            let slot = &mut comp_local[comp as usize];
+            if *slot == u32::MAX {
+                *slot = ps.comp_ids.len() as u32;
+                ps.comp_ids.push(comp);
+                ps.counts.push(0);
+            }
+            ps.counts[*slot as usize] += 1;
+            ps.lids.push(*slot);
+        }
+
+        let people = ps.comp_ids.len();
+        ps.offsets.clear();
+        ps.offsets.reserve(people + 1);
+        ps.offsets.push(0);
+        for p in 0..people {
+            ps.offsets.push(ps.offsets[p] + ps.counts[p] as usize);
+        }
+        ps.cursor.clear();
+        ps.cursor.extend(ps.offsets[..people].iter().map(|&o| o as u32));
+        ps.keys.clear();
+        ps.keys.reserve(total_linked);
+        unsafe { ps.keys.set_len(total_linked); }
+
+        let mut i = 0usize;
+        for r in &ev.linked {
+            let c = unsafe { ps.cursor.get_unchecked_mut(*ps.lids.get_unchecked(i) as usize) };
+            unsafe { *ps.keys.get_unchecked_mut(*c as usize) = r.key };
+            *c += 1;
+            i += 1;
+        }
+
+        let comp_local = &scratch.comp_local;
+        ps.clicks.clear();
+        for c in &clk.linked {
+            let l = comp_local[c.comp_id as usize];
+            if l != u32::MAX {
+                ps.clicks.push((
+                    l,
+                    ClickRef {
+                        ts_ms: c.ts_ms,
+                        camp_idx: c.camp_idx,
+                        cid_len: c.cid_len,
+                        cid_bytes: c.cid_bytes,
+                    },
+                ));
             }
         }
-        let people = ps.comp_ids.len();
-        place_keys::<K>(
-            &ev.linked,
-            &ps.lids,
-            &ps.counts,
-            &mut ps.offsets,
-            &mut ps.cursor,
-            &mut ps.keys,
-            |data, pos| {
-                let key = K::read_from(data, pos + 4);
-                (key, pos + rec)
-            },
-        );
-        let comp_local = &scratch.comp_local;
-        let lchunks: Vec<&[u8]> = clk.linked_chunks.iter().map(|c| c.as_slice()).collect();
-        gather_clicks(&lchunks, clk.linked_count, true, &mut ps.clicks, |comp, _, _| {
-            let l = comp_local[comp as usize];
-            (l != u32::MAX).then_some(l)
-        });
         for &c in &ps.comp_ids {
             scratch.comp_local[c as usize] = u32::MAX;
         }
@@ -722,7 +688,6 @@ fn run_partition<K: EvKey>(
                 ctx.canon.get(ps.comp_ids[p]),
                 &mut ps.keys[ps.offsets[p]..ps.offsets[p + 1]],
                 &mut ps.ck_out[ps.ck_offsets[p]..ps.ck_offsets[p + 1]],
-                &lchunks,
                 ctx.lookups,
                 scratch,
                 acc,
@@ -731,84 +696,124 @@ fn run_partition<K: EvKey>(
         }
     }
 
-    // People with a single unlinked ID, keyed by the ID itself.
-    if ev.singleton_count > 0 {
+    let total_sing = ev.singletons.len();
+    if total_sing > 0 {
         let group = crate::prof::Span::new(crate::prof::SESS_GROUP);
         ps.table.clear();
-        ps.uid_ptrs.clear();
+        ps.uid_bytes.clear();
+        ps.uid_len.clear();
         ps.uid_h.clear();
         ps.counts.clear();
         ps.lids.clear();
-        ps.lids.reserve(ev.singleton_count);
+        ps.lids.reserve(total_sing);
 
-        for chunk in &ev.singletons {
-            let data = chunk.as_slice();
-            let mut pos = 0usize;
-            while pos < data.len() {
-                let h = rd_u64(data, pos);
-                pos += 8;
-                let ulen = read_varint(data, &mut pos);
-                let uid = &data[pos..pos + ulen];
-                pos += ulen + K::BYTES;
+        let mut last_h = 0u64;
+        let mut last_l = 0u32;
+        let mut has_last = false;
+
+        let mask = 8191usize;
+        let mut name_table: Vec<(u64, u8, [u8; 16])> = vec![(0, 0, [0; 16]); mask + 1];
+        for &(uh, len, bytes) in &ev.uid_names {
+            let mut idx = (uh as usize) & mask;
+            loop {
+                let slot = unsafe { name_table.get_unchecked_mut(idx) };
+                if slot.0 == 0 || slot.0 == uh {
+                    *slot = (uh, len, bytes);
+                    break;
+                }
+                idx = (idx + 1) & mask;
+            }
+        }
+
+        for r in &ev.singletons {
+            let h = r.uh;
+            let l = if has_last && h == last_h {
+                last_l
+            } else {
                 let th = h.rotate_left(32);
-                let l = match ps.table.find(th, |&l| {
-                    ps.uid_h[l as usize] == h && {
-                        let (p, len) = ps.uid_ptrs[l as usize];
-                        unsafe { std::slice::from_raw_parts(p, len as usize) == uid }
-                    }
-                }) {
+                let l = match ps.table.find(th, |&l| ps.uid_h[l as usize] == h) {
                     Some(&l) => l,
                     None => {
-                        let l = ps.uid_ptrs.len() as u32;
-                        ps.uid_ptrs.push((uid.as_ptr(), uid.len() as u32));
+                        let l = ps.uid_h.len() as u32;
                         ps.uid_h.push(h);
                         ps.counts.push(0);
                         ps.table.insert_unique(th, l, |&l| ps.uid_h[l as usize].rotate_left(32));
+
+                        let mut idx = (h as usize) & mask;
+                        let mut found = (0u8, [0u8; 16]);
+                        loop {
+                            let slot = unsafe { *name_table.get_unchecked(idx) };
+                            if slot.0 == h {
+                                found = (slot.1, slot.2);
+                                break;
+                            }
+                            if slot.0 == 0 {
+                                break;
+                            }
+                            idx = (idx + 1) & mask;
+                        }
+                        ps.uid_len.push(found.0);
+                        ps.uid_bytes.push(found.1);
                         l
                     }
                 };
-                ps.counts[l as usize] += 1;
-                ps.lids.push(l);
+                last_h = h;
+                last_l = l;
+                has_last = true;
+                l
+            };
+            ps.counts[l as usize] += 1;
+            ps.lids.push(l);
+        }
+
+        let people = ps.uid_bytes.len();
+        ps.offsets.clear();
+        ps.offsets.reserve(people + 1);
+        ps.offsets.push(0);
+        for p in 0..people {
+            ps.offsets.push(ps.offsets[p] + ps.counts[p] as usize);
+        }
+        ps.cursor.clear();
+        ps.cursor.extend(ps.offsets[..people].iter().map(|&o| o as u32));
+        ps.keys.clear();
+        ps.keys.reserve(total_sing);
+        unsafe { ps.keys.set_len(total_sing); }
+
+        let mut i = 0usize;
+        for r in &ev.singletons {
+            let c = unsafe { ps.cursor.get_unchecked_mut(*ps.lids.get_unchecked(i) as usize) };
+            unsafe { *ps.keys.get_unchecked_mut(*c as usize) = r.key };
+            *c += 1;
+            i += 1;
+        }
+
+        ps.clicks.clear();
+        for c in &clk.singletons {
+            if let Some(&l) = ps.table.find(c.uid_h.rotate_left(32), |&l| {
+                ps.uid_h[l as usize] == c.uid_h
+            }) {
+                ps.clicks.push((
+                    l,
+                    ClickRef {
+                        ts_ms: c.ts_ms,
+                        camp_idx: c.camp_idx,
+                        cid_len: c.cid_len,
+                        cid_bytes: c.cid_bytes,
+                    },
+                ));
             }
         }
-        let people = ps.uid_ptrs.len();
-        place_keys::<K>(
-            &ev.singletons,
-            &ps.lids,
-            &ps.counts,
-            &mut ps.offsets,
-            &mut ps.cursor,
-            &mut ps.keys,
-            |data, mut pos| {
-                pos += 8;
-                let ulen = read_varint(data, &mut pos);
-                pos += ulen;
-                (K::read_from(data, pos), pos + K::BYTES)
-            },
-        );
-        let schunks: Vec<&[u8]> = clk.singleton_chunks.iter().map(|c| c.as_slice()).collect();
-        gather_clicks(&schunks, clk.singleton_count, false, &mut ps.clicks, |_, uid, h| {
-            ps.table
-                .find(h.rotate_left(32), |&l| {
-                    ps.uid_h[l as usize] == h && {
-                        let (p, len) = ps.uid_ptrs[l as usize];
-                        unsafe { std::slice::from_raw_parts(p, len as usize) == uid }
-                    }
-                })
-                .copied()
-        });
         build_csr(&ps.clicks, people, &mut ps.ck_offsets, &mut ps.csr_cursor, &mut ps.ck_out);
         drop(group);
 
         let _p = crate::prof::Span::new(crate::prof::SESS_PROCESS);
         for p in 0..people {
-            let (ptr, len) = ps.uid_ptrs[p];
-            let uid = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+            let len = ps.uid_len[p] as usize;
+            let name = &ps.uid_bytes[p][..len];
             process_person(
-                uid,
+                name,
                 &mut ps.keys[ps.offsets[p]..ps.offsets[p + 1]],
                 &mut ps.ck_out[ps.ck_offsets[p]..ps.ck_offsets[p + 1]],
-                &schunks,
                 ctx.lookups,
                 scratch,
                 acc,
@@ -816,23 +821,20 @@ fn run_partition<K: EvKey>(
             )?;
         }
     }
+
     Ok(())
 }
 
-/// Phase 4: process person partitions largest-first across `ncpu` threads,
-/// streaming `user_daily` to one Parquet file per thread and merging
-/// `campaign_daily` at the end.
 pub fn run_sessions_and_write<K: EvKey>(
-    person_events: PersonEvents<K>,
-    person_clicks: PersonClicks,
+    events: PersonEvents<K>,
+    clicks: PersonClicks,
     canon: &CanonNames,
     lookups: &Lookups,
     output_dir: &Path,
     ncpu: usize,
 ) -> io::Result<()> {
-    // The arenas back every chunk in `events`; they drop when this function returns.
-    let PersonEvents { parts: events, arenas: _keep_arenas } = person_events;
-    let PersonClicks { parts: clicks, arenas: _keep_click_arenas } = person_clicks;
+    let PersonEvents { parts: events } = events;
+    let PersonClicks { parts: clicks } = clicks;
     let user_dir = output_dir.join("user_daily");
     let camp_dir = output_dir.join("campaign_daily");
     fs::create_dir_all(&user_dir)?;
@@ -843,7 +845,7 @@ pub fn run_sessions_and_write<K: EvKey>(
         .map(|pp| (events[pp].event_count() + clicks[pp].total_clicks(), pp))
         .collect();
     if order.is_empty() {
-        write_empty_user_daily(&user_dir)?;
+        write_empty_user_daily(&user_dir.join("part-000.parquet"))?;
         write_campaign_daily(&camp_dir, &lookups.campaigns, &[])?;
         return Ok(());
     }
@@ -906,5 +908,6 @@ pub fn run_sessions_and_write<K: EvKey>(
             merged.merge_from(a);
         }
     }
-    write_campaign_daily(&camp_dir, &lookups.campaigns, &merged.into_rows())
+    write_campaign_daily(&camp_dir, &lookups.campaigns, &merged.into_rows())?;
+    Ok(())
 }

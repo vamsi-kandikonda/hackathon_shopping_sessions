@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use memchr::memchr;
 
-pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+pub const DEFAULT_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
 pub fn list_csv_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
@@ -80,10 +80,6 @@ impl MappedFile {
 impl Drop for MappedFile {
     fn drop(&mut self) {
         if !self.ptr.is_null() && self.len > 0 {
-            #[cfg(target_os = "linux")]
-            unsafe {
-                libc::madvise(self.ptr, self.len, libc::MADV_DONTNEED);
-            }
             unsafe {
                 libc::munmap(self.ptr, self.len);
             }
@@ -229,21 +225,6 @@ pub fn for_each_record<'a, const N: usize>(
         };
         let limit = chunk.end;
 
-        #[cfg(target_os = "linux")]
-        {
-            const MADV_POPULATE_READ: libc::c_int = 22;
-            let a_start = pos & !4095;
-            let a_end = (limit + 512).min(file_len);
-            if a_end > a_start {
-                unsafe {
-                    libc::madvise(
-                        (data.as_ptr() as *mut u8).add(a_start) as *mut libc::c_void,
-                        a_end - a_start,
-                        MADV_POPULATE_READ,
-                    );
-                }
-            }
-        }
 
         let fast_end = file_len.saturating_sub(128);
         while pos < limit {

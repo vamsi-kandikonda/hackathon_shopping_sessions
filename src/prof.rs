@@ -6,22 +6,32 @@ use std::time::Instant;
 
 pub static ENABLED: AtomicBool = AtomicBool::new(false);
 
-pub const NAMES: [&str; 6] = [
+pub const NAMES: [&str; 11] = [
     "route.dedup",
     "route.scatter",
     "sess.group",
     "sess.process",
-    "sess.parquet",
     "sess.finish",
+    "links.scan",
+    "links.dedup",
+    "links.dsu",
+    "links.table",
+    "clicks.scan",
+    "events.scan",
 ];
 pub const ROUTE_DEDUP: usize = 0;
 pub const ROUTE_SCATTER: usize = 1;
 pub const SESS_GROUP: usize = 2;
 pub const SESS_PROCESS: usize = 3;
-pub const SESS_PARQUET: usize = 4;
-pub const SESS_FINISH: usize = 5;
+pub const SESS_FINISH: usize = 4;
+pub const LINKS_SCAN: usize = 5;
+pub const LINKS_DEDUP: usize = 6;
+pub const LINKS_DSU: usize = 7;
+pub const LINKS_TABLE: usize = 8;
+pub const CLICKS_SCAN: usize = 9;
+pub const EVENTS_SCAN: usize = 10;
 
-static NANOS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static NANOS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 #[inline(always)]
 pub fn time<T>(section: usize, f: impl FnOnce() -> T) -> T {

@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 ahash = "0.8"
 arrow-array = { version = "54", default-features = false }
+arrow-buffer = { version = "54", default-features = false }
 arrow-schema = { version = "54", default-features = false }
 hashbrown = { version = "0.15", default-features = false, features = ["inline-more"] }
 libc = "0.2"

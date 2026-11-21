@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod arena;
 mod clicks;
 mod csv_parse;
@@ -15,6 +17,8 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::mpsc::sync_channel;
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -103,10 +107,9 @@ fn pipeline<K: EvKey>(
         timer.lap("links");
         let parsed = events::parse_events::<K>(data_dir, lookups, ncpu)?;
         timer.lap("event parse");
-        let mut person_events = events::route_events::<K>(parsed, &link_lookup, ncpu);
+        let person_events = events::route_events::<K>(parsed, &link_lookup, ncpu);
         timer.lap("event route");
-        let spare = person_events.take_spare();
-        let person_clicks = clicks::process_clicks(data_dir, lookups, &link_lookup, ncpu, spare)?;
+        let person_clicks = clicks::process_clicks(data_dir, lookups, &link_lookup, ncpu)?;
         timer.lap("clicks");
         drop(link_lookup);
         session::run_sessions_and_write::<K>(person_events, person_clicks, &canon, lookups, output_dir, ncpu)?;
@@ -114,37 +117,64 @@ fn pipeline<K: EvKey>(
         return Ok(());
     }
     // Phase 1 + 2a: links load while events parse; parsing needs no link data.
+    // As soon as links finish, clicks start immediately in the background,
+    // overlapping with remaining event parse and event route.
     let t_overlap = Instant::now();
-    let (links, parsed) = thread::scope(|s| {
-        let h = s.spawn(|| {
+    let timer_on = timer.on;
+    let (tx_clicks, rx_clicks) = sync_channel::<io::Result<Arc<links::LinkLookup>>>(1);
+    let (tx_main, rx_main) = sync_channel::<io::Result<(Arc<links::LinkLookup>, Arc<links::CanonNames>)>>(1);
+
+    let (person_events, person_clicks, canon) = thread::scope(|s| {
+        s.spawn(move || {
             let r = links::load_links(data_dir, ncpu);
-            (r, t_overlap.elapsed())
+            let links_done = t_overlap.elapsed();
+            match r {
+                Ok((lookup, canon)) => {
+                    let lookup = Arc::new(lookup);
+                    let canon = Arc::new(canon);
+                    let _ = tx_clicks.send(Ok(Arc::clone(&lookup)));
+                    let _ = tx_main.send(Ok((lookup, canon)));
+                }
+                Err(e) => {
+                    let e2 = io::Error::new(e.kind(), e.to_string());
+                    let _ = tx_clicks.send(Err(e));
+                    let _ = tx_main.send(Err(e2));
+                }
+            }
+            if timer_on {
+                eprintln!(
+                    "  (overlap: links done at {:.1} ms)",
+                    links_done.as_secs_f64() * 1000.0
+                );
+            }
         });
-        let parsed = events::parse_events::<K>(data_dir, lookups, ncpu);
-        let parse_done = t_overlap.elapsed();
-        let (r, links_done) = h.join().expect("links thread panicked");
+
+        let h_clicks = s.spawn(move || {
+            let link_lookup = rx_clicks.recv().expect("links channel closed")?;
+            clicks::process_clicks(data_dir, lookups, &link_lookup, ncpu)
+        });
+
+        let parsed = events::parse_events::<K>(data_dir, lookups, ncpu)?;
         if timer.on {
             eprintln!(
-                "  (overlap: links done at {:.1} ms, parse done at {:.1} ms)",
-                links_done.as_secs_f64() * 1000.0,
-                parse_done.as_secs_f64() * 1000.0
+                "  (overlap: parse done at {:.1} ms)",
+                t_overlap.elapsed().as_secs_f64() * 1000.0
             );
         }
-        (r, parsed)
-    });
-    let (link_lookup, canon) = links?;
-    let parsed = parsed?;
-    timer.lap("links + event parse");
+        let (link_lookup, canon) = rx_main.recv().expect("links channel closed")?;
+        timer.lap("links + event parse");
 
-    // Phase 2b: route events with all cores.
-    let mut person_events = events::route_events::<K>(parsed, &link_lookup, ncpu);
-    timer.lap("event route");
+        // Phase 2b: route events with all cores.
+        let person_events = events::route_events::<K>(parsed, &link_lookup, ncpu);
+        timer.lap("event route");
 
-    // Phase 3: clicks write into parse memory that routing no longer needs.
-    let spare = person_events.take_spare();
-    let person_clicks = clicks::process_clicks(data_dir, lookups, &link_lookup, ncpu, spare)?;
-    drop(link_lookup);
-    timer.lap("clicks");
+        // Wait for background clicks to finish.
+        let person_clicks = h_clicks.join().expect("clicks thread panicked")?;
+        drop(link_lookup);
+        timer.lap("clicks");
+
+        Ok::<_, io::Error>((person_events, person_clicks, canon))
+    })?;
 
     // Phase 4: sessions, attribution and output.
     session::run_sessions_and_write::<K>(
