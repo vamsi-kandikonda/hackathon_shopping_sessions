@@ -22,12 +22,16 @@ pub struct Lookups {
     pub window_start_day: i32,
     pub num_window_days: usize,
     pub compact_mode: bool,
+    pub all_ids_utf8: bool,
     pub ym_cache: YmCache,
 
     /// Sorted byte-wise, includes `"unknown"`.
     pub categories: Vec<String>,
     pub unknown_cat_id: u32,
     pub product_to_cat: HashMap<Box<[u8]>, u32, ahash::RandomState>,
+    /// `product_by_num[n]` is the category ID of the product whose ID is
+    /// `p<n>` in canonical form (no leading zeros), or `unknown_cat_id`.
+    pub product_by_num: Vec<u32>,
 
     /// `(campaign_id, channel)`, with last entry = `("organic", "organic")`.
     pub campaigns: Vec<(String, String)>,
@@ -97,8 +101,17 @@ impl Lookups {
 
         let mut product_to_cat: HashMap<Box<[u8]>, u32, ahash::RandomState> =
             HashMap::with_capacity_and_hasher(raw_products.len(), fast_build_hasher());
+        let mut product_by_num: Vec<u32> = Vec::new();
         for (pid, cat_str) in raw_products {
             let cid = *cat_to_id.get(cat_str.as_str()).unwrap();
+            if let Some(n) = canonical_product_num(&pid) {
+                if n < 10_000_000 {
+                    if product_by_num.len() <= n {
+                        product_by_num.resize(n + 1, unknown_cat_id);
+                    }
+                    product_by_num[n] = cid;
+                }
+            }
             product_to_cat.insert(pid, cid);
         }
         drop(cat_to_id);
@@ -140,7 +153,10 @@ impl Lookups {
         campaigns.push(("organic".to_string(), "organic".to_string()));
 
         let span = window_end_ms.saturating_sub(window_start_ms);
-        let compact_mode = span >= 0 && span <= (u32::MAX as i64) && categories.len() <= 255;
+        let compact_mode = span >= 0
+            && span <= (u32::MAX as i64)
+            && window_start_ms.rem_euclid(MS_PER_DAY) == 0
+            && categories.len() <= 255;
         let ym_cache = YmCache::for_window(click_window_start_ms, window_end_ms);
 
         Ok(Self {
@@ -150,10 +166,12 @@ impl Lookups {
             window_start_day,
             num_window_days,
             compact_mode,
+            all_ids_utf8: true,
             ym_cache,
             categories,
             unknown_cat_id,
             product_to_cat,
+            product_by_num,
             campaigns,
             organic_idx,
             campaign_to_idx,
@@ -163,6 +181,11 @@ impl Lookups {
 
     #[inline(always)]
     pub fn lookup_product_cat(&self, product_id: &[u8]) -> u32 {
+        if let Some(n) = canonical_product_num(product_id) {
+            if n < 10_000_000 {
+                return self.product_by_num.get(n).copied().unwrap_or(self.unknown_cat_id);
+            }
+        }
         self.product_to_cat
             .get(product_id)
             .copied()
@@ -180,6 +203,27 @@ impl Lookups {
         }
         self.campaign_to_idx.get(campaign_id).copied()
     }
+}
+
+/// `n` if `id` is `p` followed by 1 to 9 ASCII digits with no leading zero.
+#[inline(always)]
+fn canonical_product_num(id: &[u8]) -> Option<usize> {
+    if id.len() < 2 || id.len() > 10 || id[0] != b'p' {
+        return None;
+    }
+    let digits = &id[1..];
+    if digits.len() > 1 && digits[0] == b'0' {
+        return None;
+    }
+    let mut n = 0usize;
+    for &d in digits {
+        let v = d.wrapping_sub(b'0');
+        if v > 9 {
+            return None;
+        }
+        n = n * 10 + v as usize;
+    }
+    Some(n)
 }
 
 /// `n` if `id` is exactly `c_` followed by 1 to 9 ASCII digits with no leading zero.

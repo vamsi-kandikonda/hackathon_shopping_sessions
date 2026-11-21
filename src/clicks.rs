@@ -7,8 +7,8 @@ use std::thread;
 use crate::arena::{Arena, FixedBuf, RawChunk, Span};
 use crate::hash::{PERSON_PARTS, write_raw, hash_bytes, person_part_from_comp, person_part_from_hash};
 use crate::io_chunks::{
-    DEFAULT_CHUNK_SIZE, for_each_record, for_each_record_read, list_csv_files, plan_chunks,
-    use_pread,
+    DEFAULT_CHUNK_SIZE, for_each_record, for_each_record_read, list_csv_files,
+    plan_chunks_for_read, use_pread,
 };
 use crate::links::LinkLookup;
 use crate::lookups::Lookups;
@@ -177,7 +177,7 @@ pub fn process_clicks(
     spare: Vec<Span>,
 ) -> io::Result<PersonClicks> {
     let files = list_csv_files(&data_dir.join("clicks"))?;
-    let (mapped, chunks, _) = plan_chunks(&files, DEFAULT_CHUNK_SIZE)?;
+    let (mapped, chunks, _) = plan_chunks_for_read(&files, DEFAULT_CHUNK_SIZE)?;
     let parts: Vec<Mutex<PersonClickPart>> =
         (0..PERSON_PARTS).map(|_| Mutex::new(PersonClickPart::default())).collect();
     let arenas: Mutex<Vec<Arena>> = Mutex::new(Vec::new());

@@ -164,6 +164,7 @@ impl LinkLookup {
         }
     }
 
+    #[allow(dead_code)]
     #[inline(always)]
     pub fn lookup(&self, uid: &[u8], h64: u64) -> Option<u32> {
         if self.empty || !self.bloom_has(h64) {

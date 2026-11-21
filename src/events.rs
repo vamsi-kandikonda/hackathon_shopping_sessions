@@ -7,11 +7,11 @@ use std::thread;
 use crate::arena::{Arena, FixedBuf, RawChunk};
 use crate::hash::{
     EVENT_PARTS, PERSON_PARTS, write_raw, event_part, hash_bytes, person_part_from_comp,
-    person_part_from_hash, prefetch_read, rd_u32, rd_u64, read_varint, Cur,
+    person_part_from_hash, prefetch_read, rd_u16, rd_u32, rd_u64, read_varint, Cur,
 };
 use crate::io_chunks::{
-    DEFAULT_CHUNK_SIZE, for_each_record, for_each_record_stream, list_csv_files, plan_chunks,
-    use_pread,
+    DEFAULT_CHUNK_SIZE, for_each_record, for_each_record_stream, list_csv_files,
+    plan_chunks_for_read, use_pread,
 };
 use crate::links::LinkLookup;
 use crate::lookups::Lookups;
@@ -148,27 +148,25 @@ pub struct PersonEvents<K: EvKey> {
 }
 
 impl<K: EvKey> PersonEvents<K> {
-    /// Dead parse memory left over after routing, for the click phase to
-    /// reuse. The spans stay valid as long as `self` is alive.
+    /// Dead parse memory left over after routing, for the click and session
+    /// phases to reuse. The spans stay valid as long as `self` is alive.
     pub fn take_spare(&mut self) -> Vec<crate::arena::Span> {
         self.arenas.iter_mut().flat_map(|a| a.take_spare()).collect()
     }
+}
+
+/// Raw parsed events, partitioned by `hash(event_id)`.
+pub struct ParsedEvents {
+    parts: Vec<Vec<RawChunk>>,
+    counts: Vec<usize>,
+    /// Owns the memory behind every chunk in `parts`.
+    arenas: Vec<Arena>,
 }
 
 impl<K: EvKey> PersonPart<K> {
     pub fn event_count(&self) -> usize {
         self.linked_count + self.singleton_count
     }
-}
-
-/// Raw parsed events, partitioned by `hash(event_id)`. Records are
-/// `[tag, eid_len, eid, ingest_sec: u64]` plus, for valid rows,
-/// `[ts_rel, (price: u32, cat: u32 if purchase), uid_len, uid]`.
-/// Invalid rows stay as tombstones so an invalid earliest copy still wins dedup.
-pub struct ParsedEvents {
-    parts: Vec<Vec<RawChunk>>,
-    /// Owns the memory behind every chunk in `parts`.
-    _arenas: Vec<Arena>,
 }
 
 /// Phase 2a: parse, validate and drop late events. Needs no link data, so it
@@ -179,9 +177,10 @@ pub fn parse_events<K: EvKey>(
     ncpu: usize,
 ) -> io::Result<ParsedEvents> {
     let files = list_csv_files(&data_dir.join("events"))?;
-    let (mapped, chunks, _) = plan_chunks(&files, DEFAULT_CHUNK_SIZE)?;
+    let (mapped, chunks, _) = plan_chunks_for_read(&files, DEFAULT_CHUNK_SIZE)?;
     let parts: Vec<Mutex<Vec<RawChunk>>> =
         (0..EVENT_PARTS).map(|_| Mutex::new(Vec::new())).collect();
+    let counts: Vec<AtomicUsize> = (0..EVENT_PARTS).map(|_| AtomicUsize::new(0)).collect();
     let arenas: Mutex<Vec<Arena>> = Mutex::new(Vec::new());
 
     if !chunks.is_empty() {
@@ -189,16 +188,18 @@ pub fn parse_events<K: EvKey>(
         let workers = ncpu.min(chunks.len()).max(1);
         let win_start = lookups.window_start_ms;
         let win_end = lookups.window_end_ms;
+        let ingest_base = (win_start / 1000) - 86_400;
         let ym = lookups.ym_cache;
         let pread = use_pread();
 
         thread::scope(|s| {
             for _ in 0..workers {
-                let (mapped, chunks, next_chunk, parts, arenas) =
-                    (&mapped, &chunks, &next_chunk, &parts, &arenas);
+                let (mapped, chunks, next_chunk, parts, counts, arenas) =
+                    (&mapped, &chunks, &next_chunk, &parts, &counts, &arenas);
                 s.spawn(move || {
                     let mut arena = Arena::default();
                     let mut bufs: Vec<FixedBuf> = (0..EVENT_PARTS).map(|_| FixedBuf::empty()).collect();
+                    let mut loc_counts = [0usize; EVENT_PARTS];
                     let mut rbuf: Vec<u8> = Vec::new();
                     loop {
                         let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
@@ -222,9 +223,9 @@ pub fn parse_events<K: EvKey>(
                             let mut price = 0u32;
                             let mut cat = 0u32;
                             if !uid.is_empty() && !pid.is_empty() {
-                                let kind = match etype {
-                                    b"view" | b"cart" => Some(false),
-                                    b"purchase" => Some(true),
+                                let kind = match etype.len() {
+                                    4 if etype == b"view" || etype == b"cart" => Some(false),
+                                    8 if etype == b"purchase" => Some(true),
                                     _ => None,
                                 };
                                 if let Some(is_purchase) = kind {
@@ -252,28 +253,39 @@ pub fn parse_events<K: EvKey>(
 
                             let eh = hash_bytes(eid);
                             let ep = event_part(eh);
+                            unsafe { *loc_counts.get_unchecked_mut(ep) += 1 };
                             let buf = unsafe { bufs.get_unchecked_mut(ep) };
-                            if let Some(full) = buf.reserve(eid.len() + uid.len() + 72, PARSE_FLUSH, &mut arena) {
+                            if let Some(full) = buf.reserve(eid.len() + uid.len() + 64, PARSE_FLUSH, &mut arena) {
                                 parts[ep].lock().unwrap().push(full);
                             }
+                            let ingest_u32 = (ingest_sec.saturating_sub(ingest_base)).clamp(0, u32::MAX as i64) as u32;
+                            let eh_lo = eh as u32;
+                            let eh_hi = ((eh >> 32) as u16) | 1;
+                            let tag_byte = if !valid {
+                                0u8
+                            } else if purchase {
+                                TAG_VALID | TAG_PURCHASE
+                            } else {
+                                TAG_VALID
+                            };
                             let n = unsafe {
                                 write_raw(buf.tail(), |c| {
-                                    if !valid {
-                                        c.u8(0);
-                                        c.varint(eid.len());
-                                        c.bytes(eid);
-                                        c.u64(eh);
-                                        c.u64(ingest_sec as u64);
-                                    } else {
-                                        c.u8(if purchase { TAG_VALID | TAG_PURCHASE } else { TAG_VALID });
-                                        c.varint(eid.len());
-                                        c.bytes(eid);
-                                        c.u64(eh);
-                                        c.u64(ingest_sec as u64);
-                                        K::write_ts(c, (ts_ms - win_start) as u64);
-                                        if purchase {
-                                            c.u32(price);
-                                            c.u32(cat);
+                                    c.u8(tag_byte);
+                                    c.u16(eh_hi);
+                                    c.u32(eh_lo);
+                                    c.u32(ingest_u32);
+                                    c.varint(eid.len());
+                                    c.bytes(eid);
+                                    if valid {
+                                        let ts_rel = (ts_ms - win_start) as u64;
+                                        if K::BYTES == 8 && !purchase {
+                                            c.u32(ts_rel as u32);
+                                        } else {
+                                            K::write_ts(c, ts_rel);
+                                            if purchase {
+                                                c.u32(price);
+                                                c.u16(cat as u16);
+                                            }
                                         }
                                         c.varint(uid.len());
                                         c.bytes(uid);
@@ -293,6 +305,9 @@ pub fn parse_events<K: EvKey>(
                         if buf.len() > 0 {
                             parts[ep].lock().unwrap().push(buf.take());
                         }
+                        if loc_counts[ep] > 0 {
+                            counts[ep].fetch_add(loc_counts[ep], Ordering::Relaxed);
+                        }
                     }
                     arenas.lock().unwrap().push(arena);
                 });
@@ -302,20 +317,29 @@ pub fn parse_events<K: EvKey>(
 
     Ok(ParsedEvents {
         parts: parts.into_iter().map(|m| m.into_inner().unwrap()).collect(),
-        _arenas: arenas.into_inner().unwrap(),
+        counts: counts.into_iter().map(|c| c.into_inner()).collect(),
+        arenas: arenas.into_inner().unwrap(),
     })
 }
 
 /// Dedup table entry. Bit 31 of `chunk_flags` marks a valid kept copy.
+/// `eid_len` and `uid_len` fit in `u16` (generator IDs are 8 to 10 bytes).
 #[derive(Clone, Copy)]
 struct Rec<K: EvKey> {
-    ingest_sec: i64,
     key: K,
     chunk_flags: u32,
     eid_off: u32,
-    eid_len: u32,
     uid_off: u32,
-    uid_len: u32,
+    eid_len: u16,
+    uid_len: u16,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DedupSlot {
+    idx: u32,
+    tag: u16,
+    _pad: u16,
 }
 
 impl<K: EvKey> Rec<K> {
@@ -328,79 +352,72 @@ impl<K: EvKey> Rec<K> {
         (self.chunk_flags & 0x7FFF_FFFF) as usize
     }
     #[inline(always)]
+    fn ingest_sec(&self, chunks: &[&[u8]]) -> u32 {
+        let d = chunks[self.chunk()];
+        let varint_bytes = if (self.eid_len as usize) < 0x80 { 1 } else { 2 };
+        rd_u32(d, self.eid_off as usize - varint_bytes - 4)
+    }
+    #[inline(always)]
     fn eid<'a>(&self, chunks: &'a [&'a [u8]]) -> &'a [u8] {
         let d = &chunks[self.chunk()];
-        &d[self.eid_off as usize..(self.eid_off + self.eid_len) as usize]
+        &d[self.eid_off as usize..self.eid_off as usize + self.eid_len as usize]
     }
     #[inline(always)]
     fn uid<'a>(&self, chunks: &'a [&'a [u8]]) -> &'a [u8] {
         let d = &chunks[self.chunk()];
-        &d[self.uid_off as usize..(self.uid_off + self.uid_len) as usize]
-    }
-}
-
-fn grow_table<K: EvKey>(slots: &mut Vec<(u32, u32)>, entries: &[Rec<K>], chunks: &[&[u8]]) {
-    let cap = (slots.len() * 2).max(1024);
-    slots.clear();
-    slots.resize(cap, (0, 0));
-    let mask = cap - 1;
-    for (i, e) in entries.iter().enumerate() {
-        let h = hash_bytes(e.eid(chunks));
-        let tag = ((h >> 32) as u32) | 1;
-        let mut idx = (h as usize) & mask;
-        while slots[idx].0 != 0 {
-            idx = (idx + 1) & mask;
-        }
-        slots[idx] = (tag, i as u32 + 1);
+        &d[self.uid_off as usize..self.uid_off as usize + self.uid_len as usize]
     }
 }
 
 /// Keep, per `event_id`, the copy with the smallest `ingest_ts`.
 fn dedup_partition<K: EvKey>(
     chunks: &[&[u8]],
-    slots: &mut Vec<(u32, u32)>,
+    est_records: usize,
+    slots: &mut Vec<DedupSlot>,
     entries: &mut Vec<Rec<K>>,
 ) {
     entries.clear();
-    let total: usize = chunks.iter().map(|c| c.len()).sum();
-    let cap = ((total / 24).max(64) * 2).next_power_of_two().max(1024);
+    let cap = ((est_records * 10 / 7).max(64)).next_power_of_two().max(1024);
     slots.clear();
-    slots.resize(cap, (0, 0));
-    let mut mask = cap - 1;
-    let mut limit = cap * 7 / 10;
-    let mut batch: Vec<(u64, Rec<K>)> = Vec::with_capacity(PREFETCH_BATCH);
+    slots.resize(
+        cap,
+        DedupSlot {
+            idx: 0,
+            tag: 0,
+            _pad: 0,
+        },
+    );
+    let mask = cap - 1;
+    let mut batch: Vec<(u32, u16, u32, Rec<K>)> = Vec::with_capacity(PREFETCH_BATCH);
 
-    let insert_batch = |batch: &mut Vec<(u64, Rec<K>)>,
-                        slots: &mut Vec<(u32, u32)>,
-                        entries: &mut Vec<Rec<K>>,
-                        mask: &mut usize,
-                        limit: &mut usize| {
-        for (h, rec) in batch.drain(..) {
-            if entries.len() >= *limit {
-                grow_table(slots, entries, chunks);
-                *mask = slots.len() - 1;
-                *limit = slots.len() * 7 / 10;
-            }
-            let tag = ((h >> 32) as u32) | 1;
-            let mut idx = (h as usize) & *mask;
-            let eid = rec.eid(chunks);
+    let insert_batch = |batch: &mut Vec<(u32, u16, u32, Rec<K>)>,
+                        slots: &mut Vec<DedupSlot>,
+                        entries: &mut Vec<Rec<K>>| {
+        for (h_lo, tag, ingest_sec, rec) in batch.drain(..) {
+            let mut idx = (h_lo as usize) & mask;
             loop {
-                let (stag, sidx) = unsafe { *slots.get_unchecked(idx) };
-                if stag == 0 {
+                let s = unsafe { *slots.get_unchecked(idx) };
+                if s.tag == 0 {
                     entries.push(rec);
-                    unsafe { *slots.get_unchecked_mut(idx) = (tag, entries.len() as u32) };
+                    unsafe {
+                        *slots.get_unchecked_mut(idx) = DedupSlot {
+                            idx: entries.len() as u32,
+                            tag,
+                            _pad: 0,
+                        };
+                    }
                     break;
                 }
-                if stag == tag {
-                    let e = unsafe { entries.get_unchecked_mut((sidx - 1) as usize) };
-                    if e.eid_len == rec.eid_len && e.eid(chunks) == eid {
-                        if rec.ingest_sec < e.ingest_sec {
+                if s.tag == tag {
+                    let e = unsafe { entries.get_unchecked_mut((s.idx - 1) as usize) };
+                    if e.eid_len == rec.eid_len && e.eid(chunks) == rec.eid(chunks) {
+                        if ingest_sec < e.ingest_sec(chunks) {
                             *e = rec;
                         }
                         break;
                     }
                 }
-                idx = (idx + 1) & *mask;
+                idx = (idx + 1) & mask;
             }
         }
     };
@@ -410,13 +427,13 @@ fn dedup_partition<K: EvKey>(
         let mut pos = 0usize;
         while pos < data.len() {
             let tag = data[pos];
-            pos += 1;
+            let h_tag = rd_u16(data, pos + 1);
+            let h_lo = rd_u32(data, pos + 3);
+            let ingest_sec = rd_u32(data, pos + 7);
+            pos += 11;
             let eid_len = read_varint(data, &mut pos);
             let eid_off = pos;
             pos += eid_len;
-            let h = rd_u64(data, pos);
-            let ingest_sec = rd_u64(data, pos + 8) as i64;
-            pos += 16;
 
             let valid = (tag & TAG_VALID) != 0;
             let mut key = K::pack(0, 0, 0);
@@ -427,8 +444,8 @@ fn dedup_partition<K: EvKey>(
                 pos += K::TS_BYTES;
                 let (price, cat) = if (tag & TAG_PURCHASE) != 0 {
                     let p = rd_u32(data, pos);
-                    let c = rd_u32(data, pos + 4);
-                    pos += 8;
+                    let c = rd_u16(data, pos + 4) as u32;
+                    pos += 6;
                     (p, c)
                 } else {
                     (0, 0)
@@ -439,26 +456,27 @@ fn dedup_partition<K: EvKey>(
                 pos += uid_len;
             }
 
-            prefetch_read(unsafe { slots.as_ptr().add((h as usize) & mask) });
+            prefetch_read(unsafe { slots.as_ptr().add((h_lo as usize) & mask) });
             batch.push((
-                h,
+                h_lo,
+                h_tag,
+                ingest_sec,
                 Rec {
-                    ingest_sec,
                     key,
                     chunk_flags: (ci as u32) | ((valid as u32) << 31),
                     eid_off: eid_off as u32,
-                    eid_len: eid_len as u32,
                     uid_off: uid_off as u32,
-                    uid_len: uid_len as u32,
+                    eid_len: eid_len as u16,
+                    uid_len: uid_len as u16,
                 },
             ));
             if batch.len() == PREFETCH_BATCH {
-                insert_batch(&mut batch, slots, entries, &mut mask, &mut limit);
+                insert_batch(&mut batch, slots, entries);
             }
         }
     }
     if !batch.is_empty() {
-        insert_batch(&mut batch, slots, entries, &mut mask, &mut limit);
+        insert_batch(&mut batch, slots, entries);
     }
 }
 
@@ -471,7 +489,7 @@ pub fn route_events<K: EvKey>(
 ) -> PersonEvents<K> {
     // Routed output is written into parse chunks that are already consumed,
     // so the parse arenas move into `PersonEvents` and live until the end.
-    let ParsedEvents { parts, _arenas: parse_arenas } = parsed;
+    let ParsedEvents { parts, counts, arenas: parse_arenas } = parsed;
     let inputs: Vec<Mutex<Vec<RawChunk>>> = parts.into_iter().map(Mutex::new).collect();
     let out: Vec<Mutex<PersonPart<K>>> =
         (0..PERSON_PARTS).map(|_| Mutex::new(PersonPart::default())).collect();
@@ -483,10 +501,10 @@ pub fn route_events<K: EvKey>(
 
     thread::scope(|s| {
         for _ in 0..ncpu.max(1) {
-            let (inputs, out, next, out_arenas) = (&inputs, &out, &next, &out_arenas);
+            let (inputs, counts, out, next, out_arenas) = (&inputs, &counts, &out, &next, &out_arenas);
             s.spawn(move || {
                 let mut arena = Arena::default();
-                let mut slots: Vec<(u32, u32)> = Vec::new();
+                let mut slots: Vec<DedupSlot> = Vec::new();
                 let mut entries: Vec<Rec<K>> = Vec::new();
                 let mut loc_linked: Vec<FixedBuf> = (0..PERSON_PARTS).map(|_| FixedBuf::empty()).collect();
                 let mut loc_sing: Vec<FixedBuf> = (0..PERSON_PARTS).map(|_| FixedBuf::empty()).collect();
@@ -505,7 +523,7 @@ pub fn route_events<K: EvKey>(
                     }
                     let chunks: Vec<&[u8]> = raw.iter().map(|c| c.as_slice()).collect();
                     crate::prof::time(crate::prof::ROUTE_DEDUP, || {
-                        dedup_partition::<K>(&chunks, &mut slots, &mut entries)
+                        dedup_partition::<K>(&chunks, counts[ep], &mut slots, &mut entries)
                     });
                     let _scatter = crate::prof::Span::new(crate::prof::ROUTE_SCATTER);
                     let n = entries.len();

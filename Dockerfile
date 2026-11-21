@@ -10,7 +10,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs && \
     if [ "$TARGETARCH" = "amd64" ]; then \
-        export RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+aes"; \
+        export RUSTFLAGS="-C target-cpu=cascadelake"; \
     fi && \
     cargo build --release --locked && \
     rm -rf src
@@ -19,7 +19,7 @@ RUN mkdir -p src && echo "fn main() {}" > src/main.rs && \
 COPY src/ ./src/
 RUN touch src/main.rs && \
     if [ "$TARGETARCH" = "amd64" ]; then \
-        export RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+aes"; \
+        export RUSTFLAGS="-C target-cpu=cascadelake"; \
     fi && \
     cargo build --release --locked
 

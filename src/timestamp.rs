@@ -250,16 +250,24 @@ pub fn parse_timestamp_in_window(
         // F1: YYYY-MM-DDTHH:MM:SSZ
         parse_civil_19_sec_fast(b, ym_cache)? * 1000
     } else if len == 13 {
-        // Fast path for standard 13-digit epoch ms (99.9% of F3 timestamps!)
-        let mut val: i64 = 0;
-        for &c in b {
-            let d = c.wrapping_sub(b'0');
-            if d > 9 {
-                return None;
-            }
-            val = val * 10 + (d as i64);
+        // Fast path for standard 13-digit epoch ms (99.9% of F3 timestamps!):
+        // SWAR 8-digit + 4-digit + 1-digit parse.
+        let w8 = u64::from_le_bytes(unsafe { *(b.as_ptr() as *const [u8; 8]) }).wrapping_sub(0x3030_3030_3030_3030);
+        let w4 = u32::from_le_bytes(unsafe { *(b.as_ptr().add(8) as *const [u8; 4]) }).wrapping_sub(0x3030_3030);
+        let d12 = b[12].wrapping_sub(b'0');
+        let bad8 = ((w8 | w8.wrapping_add(0x7676_7676_7676_7676)) & 0x8080_8080_8080_8080)
+            | (w8 & 0x7070_7070_7070_7070);
+        let bad4 = ((w4 | w4.wrapping_add(0x7676_7676)) & 0x8080_8080)
+            | (w4 & 0x7070_7070);
+        if (bad8 != 0) | (bad4 != 0) | (d12 > 9) {
+            return None;
         }
-        val
+        let p8 = ((w8 & 0x00FF_00FF_00FF_00FF) * 10) + ((w8 >> 8) & 0x00FF_00FF_00FF_00FF);
+        let p8 = ((p8 & 0x0000_FFFF_0000_FFFF) * 100) + ((p8 >> 16) & 0x0000_FFFF_0000_FFFF);
+        let hi8 = (((p8 & 0xFFFF_FFFF) * 10_000) + (p8 >> 32)) as i64;
+        let p4 = ((w4 & 0x00FF_00FF) * 10) + ((w4 >> 8) & 0x00FF_00FF);
+        let lo4 = (((p4 & 0xFFFF) * 100) + (p4 >> 16)) as i64;
+        hi8 * 100_000 + lo4 * 10 + (d12 as i64)
     } else if len == 25 && (b[19] == b'+' || b[19] == b'-') {
         // F2: YYYY-MM-DDTHH:MM:SS±HH:MM
         if b[22] != b':' {

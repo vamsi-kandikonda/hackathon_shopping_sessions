@@ -87,15 +87,21 @@ impl UserDailyWriter {
     pub fn push(
         &mut self,
         user_id: &[u8],
+        trusted_utf8: bool,
         day: i32,
         sessions: i64,
         events: i64,
         revenue_cents: i64,
         top_category: Option<&str>,
     ) -> io::Result<()> {
-        match std::str::from_utf8(user_id) {
-            Ok(s) => self.user_ids.append_value(s),
-            Err(_) => self.user_ids.append_value(String::from_utf8_lossy(user_id)),
+        if trusted_utf8 {
+            self.user_ids
+                .append_value(unsafe { std::str::from_utf8_unchecked(user_id) });
+        } else {
+            match std::str::from_utf8(user_id) {
+                Ok(s) => self.user_ids.append_value(s),
+                Err(_) => self.user_ids.append_value(String::from_utf8_lossy(user_id)),
+            }
         }
         self.days.append_value(day);
         self.sessions.append_value(sessions);
