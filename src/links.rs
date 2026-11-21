@@ -6,10 +6,10 @@ use std::thread;
 
 use hashbrown::HashMap;
 
-use crate::csv_parse::split_fields;
+
 use crate::hash::{fast_build_hasher, hash_bytes, prefetch_read};
 use crate::io_chunks::{
-    DEFAULT_CHUNK_SIZE, MappedFile, for_each_line_in_chunk, list_csv_files, plan_chunks,
+    DEFAULT_CHUNK_SIZE, MappedFile, for_each_record, list_csv_files, plan_chunks,
 };
 
 const LINK_SHARDS: usize = 64;
@@ -73,13 +73,77 @@ impl LinkShard {
 pub struct LinkLookup {
     shards: Vec<LinkShard>,
     empty: bool,
+    /// Blocked Bloom filter over all linked IDs: 512-bit blocks, two bits per
+    /// ID. Most unlinked IDs are rejected here without touching the big table.
+    bloom: Vec<[u64; 8]>,
+    bloom_mask: usize,
 }
+
+const MAX_BATCH: usize = 64;
 
 impl LinkLookup {
     pub fn empty() -> Self {
         Self {
             shards: Vec::new(),
             empty: true,
+            bloom: Vec::new(),
+            bloom_mask: 0,
+        }
+    }
+
+    fn with_bloom(shards: Vec<LinkShard>, hashes: impl Iterator<Item = u64>, n: usize) -> Self {
+        // About 16 bits per ID: roughly 2 to 3% false positives.
+        let blocks = ((n * 16).div_ceil(512)).next_power_of_two().max(1);
+        let mut bloom = vec![[0u64; 8]; blocks];
+        let mask = blocks - 1;
+        for h in hashes {
+            let (b, i1, i2) = Self::bloom_pos(h, mask);
+            bloom[b][i1 >> 6] |= 1 << (i1 & 63);
+            bloom[b][i2 >> 6] |= 1 << (i2 & 63);
+        }
+        Self {
+            shards,
+            empty: false,
+            bloom,
+            bloom_mask: mask,
+        }
+    }
+
+    #[inline(always)]
+    fn bloom_pos(h: u64, mask: usize) -> (usize, usize, usize) {
+        (((h >> 16) as usize) & mask, ((h >> 40) & 511) as usize, ((h >> 49) & 511) as usize)
+    }
+
+    #[inline(always)]
+    fn bloom_has(&self, h: u64) -> bool {
+        let (b, i1, i2) = Self::bloom_pos(h, self.bloom_mask);
+        let blk = unsafe { self.bloom.get_unchecked(b) };
+        (blk[i1 >> 6] >> (i1 & 63)) & (blk[i2 >> 6] >> (i2 & 63)) & 1 != 0
+    }
+
+    /// Resolve up to 64 IDs: prefetch Bloom blocks, then prefetch table slots
+    /// only for IDs that pass the filter, then probe.
+    #[inline]
+    pub fn lookup_batch(&self, uids: &[&[u8]], hs: &[u64], out: &mut [Option<u32>]) {
+        let n = uids.len();
+        debug_assert!(n <= MAX_BATCH && hs.len() == n && out.len() >= n);
+        if self.empty {
+            out[..n].fill(None);
+            return;
+        }
+        for &h in hs {
+            let (b, _, _) = Self::bloom_pos(h, self.bloom_mask);
+            prefetch_read(unsafe { self.bloom.as_ptr().add(b) });
+        }
+        let mut maybe = [false; MAX_BATCH];
+        for i in 0..n {
+            if self.bloom_has(hs[i]) {
+                maybe[i] = true;
+                self.prefetch(hs[i]);
+            }
+        }
+        for i in 0..n {
+            out[i] = if maybe[i] { self.probe(uids[i], hs[i]) } else { None };
         }
     }
 
@@ -102,9 +166,14 @@ impl LinkLookup {
 
     #[inline(always)]
     pub fn lookup(&self, uid: &[u8], h64: u64) -> Option<u32> {
-        if self.empty {
+        if self.empty || !self.bloom_has(h64) {
             return None;
         }
+        self.probe(uid, h64)
+    }
+
+    #[inline(always)]
+    fn probe(&self, uid: &[u8], h64: u64) -> Option<u32> {
         let sh = unsafe { self.shards.get_unchecked((h64 >> 58) as usize) };
         if sh.slots.is_empty() {
             return None;
@@ -245,10 +314,7 @@ pub fn load_links(data_dir: &Path, ncpu: usize) -> io::Result<(LinkLookup, Canon
                     let mf = &mapped[chunk.file_idx];
                     let base_ptr = mf.as_slice().as_ptr() as usize;
                     let fidx = chunk.file_idx as u16;
-                    for_each_line_in_chunk(mf, chunk, |line| {
-                        let Some([a, b]) = split_fields::<2>(line) else {
-                            return;
-                        };
+                    for_each_record::<2>(mf, chunk, |[a, b]| {
                         if a.is_empty() || b.is_empty() || a == b {
                             return;
                         }
@@ -437,10 +503,7 @@ fn build_links_single(
         .collect();
 
     (
-        LinkLookup {
-            shards,
-            empty: false,
-        },
+        LinkLookup::with_bloom(shards, id_spans.iter().map(|&(_, h)| h), id_spans.len()),
         canon_names,
     )
 }
@@ -658,10 +721,11 @@ fn build_links_parallel(
         .collect();
 
     (
-        LinkLookup {
+        LinkLookup::with_bloom(
             shards,
-            empty: false,
-        },
+            shard_outs.iter().flat_map(|o| o.spans.iter().map(|&(_, h)| h)),
+            total_unique,
+        ),
         canon_names,
     )
 }

@@ -68,7 +68,7 @@ fn split_fields_scalar<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
 }
 
 #[inline(always)]
-fn extract_from_masks<const N: usize>(
+pub fn extract_from_masks<const N: usize>(
     line: &[u8],
     mut comma_mask: u128,
     quote_mask: u128,
@@ -135,11 +135,83 @@ fn extract_from_masks<const N: usize>(
     }
 }
 
+/// Scan the line starting at `p` for its newline, commas and quotes in one
+/// pass. Returns `(line_len, comma_mask, quote_mask)` with mask bits only for
+/// bytes inside the line, or `None` if no newline appears in the first 128
+/// bytes. The caller guarantees 128 readable bytes at `p`.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-fn scan_masks_128(line: &[u8]) -> (u128, u128) {
+pub unsafe fn scan_line_128(p: *const u8) -> Option<(usize, u128, u128)> {
+    use std::arch::x86_64::*;
+    let v_nl = _mm256_set1_epi8(b'\n' as i8);
+    let v_comma = _mm256_set1_epi8(b',' as i8);
+    let v_quote = _mm256_set1_epi8(b'"' as i8);
+    let mut cm = 0u128;
+    let mut qm = 0u128;
+    let mut off = 0usize;
+    while off < 128 {
+        let chunk = _mm256_loadu_si256(p.add(off) as *const __m256i);
+        let nl = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_nl)) as u32;
+        let c = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_comma)) as u32;
+        let q = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_quote)) as u32;
+        if nl != 0 {
+            let k = nl.trailing_zeros();
+            let keep = (1u32 << k).wrapping_sub(1);
+            cm |= ((c & keep) as u128) << off;
+            qm |= ((q & keep) as u128) << off;
+            return Some((off + k as usize, cm, qm));
+        }
+        cm |= (c as u128) << off;
+        qm |= (q as u128) << off;
+        off += 32;
+    }
+    None
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn scan_line_128(p: *const u8) -> Option<(usize, u128, u128)> {
+    use std::arch::aarch64::*;
+    #[inline(always)]
+    unsafe fn movemask(v: uint8x16_t, bits: uint8x16_t) -> u32 {
+        let m = vandq_u8(v, bits);
+        (vaddv_u8(vget_low_u8(m)) as u32) | ((vaddv_u8(vget_high_u8(m)) as u32) << 8)
+    }
+    let bits_arr: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    let bits = vld1q_u8(bits_arr.as_ptr());
+    let v_nl = vdupq_n_u8(b'\n');
+    let v_comma = vdupq_n_u8(b',');
+    let v_quote = vdupq_n_u8(b'"');
+    let mut cm = 0u128;
+    let mut qm = 0u128;
+    let mut off = 0usize;
+    while off < 128 {
+        let chunk = vld1q_u8(p.add(off));
+        let nlv = vceqq_u8(chunk, v_nl);
+        let c = movemask(vceqq_u8(chunk, v_comma), bits);
+        let q = movemask(vceqq_u8(chunk, v_quote), bits);
+        if vmaxvq_u8(nlv) != 0 {
+            let k = movemask(nlv, bits).trailing_zeros();
+            let keep = (1u32 << k).wrapping_sub(1);
+            cm |= ((c & keep) as u128) << off;
+            qm |= ((q & keep) as u128) << off;
+            return Some((off + k as usize, cm, qm));
+        }
+        cm |= (c as u128) << off;
+        qm |= (q as u128) << off;
+        off += 16;
+    }
+    None
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn scan_masks_128(line: &[u8]) -> Option<(u128, u128)> {
     use std::arch::x86_64::*;
     let len = line.len();
+    if len < 32 {
+        return None;
+    }
     let ptr = line.as_ptr();
     let mut comma_mask = 0u128;
     let mut quote_mask = 0u128;
@@ -156,27 +228,27 @@ fn scan_masks_128(line: &[u8]) -> (u128, u128) {
             off += 32;
         }
         if off < len {
+            // Re-read the last 32 bytes of the line and keep only the new ones:
+            // no copy and no read past the end of the line.
             let rem = len - off;
-            let mut tail = [0u8; 32];
-            std::ptr::copy_nonoverlapping(ptr.add(off), tail.as_mut_ptr(), rem);
-            let chunk = _mm256_loadu_si256(tail.as_ptr() as *const __m256i);
-            let valid_bits = if rem == 32 { u32::MAX } else { (1u32 << rem) - 1 };
-            let cm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_comma)) as u32 & valid_bits)
-                as u128;
-            let qm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_quote)) as u32 & valid_bits)
-                as u128;
-            comma_mask |= cm << off;
-            quote_mask |= qm << off;
+            let chunk = _mm256_loadu_si256(ptr.add(len - 32) as *const __m256i);
+            let cm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_comma)) as u32) >> (32 - rem);
+            let qm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_quote)) as u32) >> (32 - rem);
+            comma_mask |= (cm as u128) << off;
+            quote_mask |= (qm as u128) << off;
         }
     }
-    (comma_mask, quote_mask)
+    Some((comma_mask, quote_mask))
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn scan_masks_128(line: &[u8]) -> (u128, u128) {
+fn scan_masks_128(line: &[u8]) -> Option<(u128, u128)> {
     use std::arch::aarch64::*;
     let len = line.len();
+    if len < 16 {
+        return None;
+    }
     let ptr = line.as_ptr();
     let mut comma_mask = 0u128;
     let mut quote_mask = 0u128;
@@ -206,17 +278,14 @@ fn scan_masks_128(line: &[u8]) -> (u128, u128) {
         }
         if off < len {
             let rem = len - off;
-            let mut tail = [0u8; 16];
-            std::ptr::copy_nonoverlapping(ptr.add(off), tail.as_mut_ptr(), rem);
-            let chunk = vld1q_u8(tail.as_ptr());
-            let valid_bits = ((1u32 << rem) - 1) as u16;
-            let cm = (movemask_neon(vceqq_u8(chunk, v_comma), bit_mask) & valid_bits) as u128;
-            let qm = (movemask_neon(vceqq_u8(chunk, v_quote), bit_mask) & valid_bits) as u128;
-            comma_mask |= cm << off;
-            quote_mask |= qm << off;
+            let chunk = vld1q_u8(ptr.add(len - 16));
+            let cm = movemask_neon(vceqq_u8(chunk, v_comma), bit_mask) >> (16 - rem);
+            let qm = movemask_neon(vceqq_u8(chunk, v_quote), bit_mask) >> (16 - rem);
+            comma_mask |= (cm as u128) << off;
+            quote_mask |= (qm as u128) << off;
         }
     }
-    (comma_mask, quote_mask)
+    Some((comma_mask, quote_mask))
 }
 
 #[inline(always)]
@@ -231,8 +300,9 @@ pub fn split_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     ))]
     {
         if len <= 128 {
-            let (cm, qm) = scan_masks_128(line);
-            return extract_from_masks::<N>(line, cm, qm);
+            if let Some((cm, qm)) = scan_masks_128(line) {
+                return extract_from_masks::<N>(line, cm, qm);
+            }
         }
     }
     split_fields_scalar::<N>(line)
@@ -276,5 +346,25 @@ mod tests {
             split_fields::<7>(long_ev.as_bytes()),
             split_fields_scalar::<7>(long_ev.as_bytes())
         );
+
+        // Every length from 1 to 130 with commas and quotes in varied places,
+        // to cover the tail-block shift for each remainder.
+        for len in 1..=130usize {
+            for seed in 0..6usize {
+                let mut s: Vec<u8> = (0..len).map(|i| b'a' + ((i * 7 + seed) % 26) as u8).collect();
+                for i in (seed % 5..len).step_by(5 + seed) {
+                    s[i] = b',';
+                }
+                if seed % 2 == 1 && len > 3 {
+                    s[0] = b'"';
+                    s[2] = b'"';
+                }
+                if seed == 4 && len > 1 {
+                    s[len - 1] = b'"';
+                }
+                assert_eq!(split_fields::<4>(&s), split_fields_scalar::<4>(&s), "len {len} seed {seed}");
+                assert_eq!(split_fields::<7>(&s), split_fields_scalar::<7>(&s), "len {len} seed {seed}");
+            }
+        }
     }
 }

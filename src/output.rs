@@ -123,6 +123,10 @@ impl UserDailyWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        crate::prof::time(crate::prof::SESS_PARQUET, || self.flush_inner())
+    }
+
+    fn flush_inner(&mut self) -> io::Result<()> {
         if self.buffered == 0 {
             return Ok(());
         }

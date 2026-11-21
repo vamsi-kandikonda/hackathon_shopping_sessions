@@ -1,6 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-
-pub const EVENT_PARTS: usize = 128;
+pub const EVENT_BITS: u32 = 9;
+pub const EVENT_PARTS: usize = 1 << EVENT_BITS;
 pub const PERSON_PARTS: usize = 128;
 
 #[inline(always)]
@@ -43,18 +42,15 @@ unsafe fn read_u32_unaligned(p: *const u8) -> u32 {
     u32::from_le_bytes(*(p as *const [u8; 4]))
 }
 
-/// Ultra-fast wyhash for byte slices (4-5 CPU cycles for 8-16 byte IDs, full 64-bit avalanche).
+/// wyhash-style hash for short byte strings (IDs are usually 6 to 12 bytes).
 #[inline(always)]
 pub fn hash_bytes(bytes: &[u8]) -> u64 {
     let len = bytes.len();
     let ptr = bytes.as_ptr();
     unsafe {
-        if len >= 4 && len <= 16 {
+        if (4..=16).contains(&len) {
             let (a, b) = if len >= 8 {
-                (
-                    read_u64_unaligned(ptr),
-                    read_u64_unaligned(ptr.add(len - 8)),
-                )
+                (read_u64_unaligned(ptr), read_u64_unaligned(ptr.add(len - 8)))
             } else {
                 let lo = read_u32_unaligned(ptr) as u64;
                 let hi = read_u32_unaligned(ptr.add(len - 4)) as u64;
@@ -66,13 +62,10 @@ pub fn hash_bytes(bytes: &[u8]) -> u64 {
             let v = if len == 0 {
                 0u64
             } else {
-                ((*ptr as u64) << 16)
-                    | ((*ptr.add(len >> 1) as u64) << 8)
-                    | (*ptr.add(len - 1) as u64)
+                ((*ptr as u64) << 16) | ((*ptr.add(len >> 1) as u64) << 8) | (*ptr.add(len - 1) as u64)
             };
             return wymix(v ^ WY_S1, (len as u64) ^ WY_S0);
         }
-        // len > 16
         let mut seed = WY_S0 ^ (len as u64);
         let mut p = ptr;
         let mut rem = len;
@@ -101,7 +94,7 @@ pub fn fast_build_hasher() -> ahash::RandomState {
 
 #[inline(always)]
 pub fn event_part(h: u64) -> usize {
-    (h >> 57) as usize
+    (h >> (64 - EVENT_BITS)) as usize
 }
 
 #[inline(always)]
@@ -112,23 +105,6 @@ pub fn person_part_from_hash(h: u64) -> usize {
 #[inline(always)]
 pub fn person_part_from_comp(comp_id: u32) -> usize {
     (comp_id.wrapping_mul(0x9E37_79B1) >> 25) as usize
-}
-
-#[inline(always)]
-pub fn mix_u32(v: u32) -> u64 {
-    let mut x = (v as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
-
-#[inline(always)]
-pub fn write_varint(buf: &mut Vec<u8>, mut v: usize) {
-    while v >= 0x80 {
-        buf.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    buf.push(v as u8);
 }
 
 #[inline(always)]
@@ -151,59 +127,142 @@ pub fn read_varint(data: &[u8], pos: &mut usize) -> usize {
     }
 }
 
-/// Concurrent bitset Bloom filter (single-write-phase, then read-only) to skip clicks
-/// for people with zero surviving events. Zero false negatives guaranteed.
-pub struct ActiveBloom {
-    words: Vec<AtomicU64>,
-    bit_mask: u64,
+#[inline(always)]
+pub fn rd_u32(data: &[u8], pos: usize) -> u32 {
+    debug_assert!(pos + 4 <= data.len());
+    u32::from_le(unsafe { (data.as_ptr().add(pos) as *const u32).read_unaligned() })
 }
 
-impl ActiveBloom {
-    pub fn new_for_bytes(event_bytes: u64) -> Self {
-        let num_words: usize = if event_bytes < 1 << 20 {
-            1 << 10
-        } else if event_bytes < 1 << 28 {
-            1 << 17
-        } else {
-            1 << 21
-        };
-        let mut words = Vec::with_capacity(num_words);
-        for _ in 0..num_words {
-            words.push(AtomicU64::new(0));
-        }
-        Self {
-            words,
-            bit_mask: ((num_words as u64) << 6) - 1,
+#[inline(always)]
+pub fn rd_u64(data: &[u8], pos: usize) -> u64 {
+    debug_assert!(pos + 8 <= data.len());
+    u64::from_le(unsafe { (data.as_ptr().add(pos) as *const u64).read_unaligned() })
+}
+
+/// Copy a short slice without calling libc. Writes exactly `len` bytes using
+/// overlapping fixed-width moves; never reads or writes outside either range.
+#[inline(always)]
+unsafe fn copy_small(dst: *mut u8, src: *const u8, len: usize) {
+    if len >= 16 {
+        std::ptr::copy_nonoverlapping(src, dst, len);
+    } else if len >= 8 {
+        let a = (src as *const u64).read_unaligned();
+        let b = (src.add(len - 8) as *const u64).read_unaligned();
+        (dst as *mut u64).write_unaligned(a);
+        (dst.add(len - 8) as *mut u64).write_unaligned(b);
+    } else if len >= 4 {
+        let a = (src as *const u32).read_unaligned();
+        let b = (src.add(len - 4) as *const u32).read_unaligned();
+        (dst as *mut u32).write_unaligned(a);
+        (dst.add(len - 4) as *mut u32).write_unaligned(b);
+    } else if len > 0 {
+        *dst = *src;
+        *dst.add(len >> 1) = *src.add(len >> 1);
+        *dst.add(len - 1) = *src.add(len - 1);
+    }
+}
+
+/// Write cursor into spare capacity reserved by `append_record`. Only
+/// `append_record` can construct one, so every write stays inside the
+/// reservation as long as callers pass an honest upper bound.
+pub struct Cur {
+    p: *mut u8,
+}
+
+impl Cur {
+    #[inline(always)]
+    pub fn u8(&mut self, v: u8) {
+        unsafe {
+            *self.p = v;
+            self.p = self.p.add(1);
         }
     }
 
     #[inline(always)]
-    pub fn insert(&self, h: u64) {
-        let b1 = h & self.bit_mask;
-        let b2 = (h >> 27) & self.bit_mask;
-        let w1 = (b1 >> 6) as usize;
-        let m1 = 1u64 << (b1 & 63);
-        let w2 = (b2 >> 6) as usize;
-        let m2 = 1u64 << (b2 & 63);
-        if (self.words[w1].load(Ordering::Relaxed) & m1) == 0 {
-            self.words[w1].fetch_or(m1, Ordering::Relaxed);
-        }
-        if (self.words[w2].load(Ordering::Relaxed) & m2) == 0 {
-            self.words[w2].fetch_or(m2, Ordering::Relaxed);
+    pub fn u32(&mut self, v: u32) {
+        unsafe {
+            (self.p as *mut u32).write_unaligned(v.to_le());
+            self.p = self.p.add(4);
         }
     }
 
     #[inline(always)]
-    pub fn may_contain(&self, h: u64) -> bool {
-        let b1 = h & self.bit_mask;
-        let w1 = (b1 >> 6) as usize;
-        let m1 = 1u64 << (b1 & 63);
-        if (self.words[w1].load(Ordering::Relaxed) & m1) == 0 {
-            return false;
+    pub fn u64(&mut self, v: u64) {
+        unsafe {
+            (self.p as *mut u64).write_unaligned(v.to_le());
+            self.p = self.p.add(8);
         }
-        let b2 = (h >> 27) & self.bit_mask;
-        let w2 = (b2 >> 6) as usize;
-        let m2 = 1u64 << (b2 & 63);
-        (self.words[w2].load(Ordering::Relaxed) & m2) != 0
+    }
+
+    #[inline(always)]
+    pub fn varint(&mut self, mut v: usize) {
+        while v >= 0x80 {
+            self.u8((v as u8) | 0x80);
+            v >>= 7;
+        }
+        self.u8(v as u8);
+    }
+
+    #[inline(always)]
+    pub fn bytes(&mut self, s: &[u8]) {
+        unsafe {
+            copy_small(self.p, s.as_ptr(), s.len());
+            self.p = self.p.add(s.len());
+        }
+    }
+}
+
+/// Append one record of at most `max` bytes to `buf` with a single capacity check.
+#[inline(always)]
+pub fn append_record(buf: &mut Vec<u8>, max: usize, f: impl FnOnce(&mut Cur)) {
+    buf.reserve(max);
+    unsafe {
+        let len = buf.len();
+        let start = buf.as_mut_ptr().add(len);
+        let written = write_raw(start, f);
+        debug_assert!(written <= max);
+        buf.set_len(len + written);
+    }
+}
+
+/// Write one record at `start` and return its length. The caller guarantees
+/// enough room for the record.
+#[inline(always)]
+pub unsafe fn write_raw(start: *mut u8, f: impl FnOnce(&mut Cur)) -> usize {
+    let mut c = Cur { p: start };
+    f(&mut c);
+    c.p.offset_from(start) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_append_record_roundtrip() {
+        let mut buf = Vec::new();
+        for len in 0..40usize {
+            let s: Vec<u8> = (0..len as u8).map(|b| b.wrapping_mul(7)).collect();
+            append_record(&mut buf, len + 32, |c| {
+                c.varint(len);
+                c.bytes(&s);
+                c.u32(0xDEAD_BEEF);
+                c.u64(len as u64 * 3);
+            });
+        }
+        append_record(&mut buf, 16, |c| c.varint(300));
+        let mut pos = 0;
+        for len in 0..40usize {
+            assert_eq!(read_varint(&buf, &mut pos), len);
+            let expect: Vec<u8> = (0..len as u8).map(|b| b.wrapping_mul(7)).collect();
+            assert_eq!(&buf[pos..pos + len], &expect[..]);
+            pos += len;
+            assert_eq!(rd_u32(&buf, pos), 0xDEAD_BEEF);
+            pos += 4;
+            assert_eq!(rd_u64(&buf, pos), len as u64 * 3);
+            pos += 8;
+        }
+        assert_eq!(read_varint(&buf, &mut pos), 300);
+        assert_eq!(pos, buf.len());
     }
 }

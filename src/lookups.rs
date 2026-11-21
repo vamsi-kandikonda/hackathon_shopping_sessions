@@ -34,6 +34,9 @@ pub struct Lookups {
     pub organic_idx: u32,
     /// Only campaigns from `campaigns.csv` (never includes `"organic"`).
     pub campaign_to_idx: HashMap<Box<[u8]>, u32, ahash::RandomState>,
+    /// `campaign_by_num[n]` is the index of the campaign whose ID is exactly
+    /// `c_<n>` in canonical form (no leading zeros), or `u32::MAX`.
+    pub campaign_by_num: Vec<u32>,
 }
 
 impl Lookups {
@@ -122,6 +125,17 @@ impl Lookups {
                 }
             }
         }
+        let mut campaign_by_num: Vec<u32> = Vec::new();
+        for (i, (cid, _)) in campaigns.iter().enumerate() {
+            if let Some(n) = canonical_campaign_num(cid.as_bytes()) {
+                if n < 10_000_000 {
+                    if campaign_by_num.len() <= n {
+                        campaign_by_num.resize(n + 1, u32::MAX);
+                    }
+                    campaign_by_num[n] = i as u32;
+                }
+            }
+        }
         let organic_idx = campaigns.len() as u32;
         campaigns.push(("organic".to_string(), "organic".to_string()));
 
@@ -143,6 +157,7 @@ impl Lookups {
             campaigns,
             organic_idx,
             campaign_to_idx,
+            campaign_by_num,
         })
     }
 
@@ -156,6 +171,53 @@ impl Lookups {
 
     #[inline(always)]
     pub fn lookup_campaign(&self, campaign_id: &[u8]) -> Option<u32> {
+        // Canonical `c_<n>` IDs resolve through an array. Every canonical ID in
+        // campaigns.csv is in the array, so a canonical miss is a real miss.
+        if let Some(n) = canonical_campaign_num(campaign_id) {
+            if n < 10_000_000 {
+                return self.campaign_by_num.get(n).copied().filter(|&i| i != u32::MAX);
+            }
+        }
         self.campaign_to_idx.get(campaign_id).copied()
+    }
+}
+
+/// `n` if `id` is exactly `c_` followed by 1 to 9 ASCII digits with no leading zero.
+#[inline(always)]
+fn canonical_campaign_num(id: &[u8]) -> Option<usize> {
+    if id.len() < 3 || id.len() > 11 || id[0] != b'c' || id[1] != b'_' {
+        return None;
+    }
+    let digits = &id[2..];
+    if digits.len() > 1 && digits[0] == b'0' {
+        return None;
+    }
+    let mut n = 0usize;
+    for &d in digits {
+        let v = d.wrapping_sub(b'0');
+        if v > 9 {
+            return None;
+        }
+        n = n * 10 + v as usize;
+    }
+    Some(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_campaign_num;
+
+    #[test]
+    fn canonical_campaign_ids() {
+        assert_eq!(canonical_campaign_num(b"c_1"), Some(1));
+        assert_eq!(canonical_campaign_num(b"c_0"), Some(0));
+        assert_eq!(canonical_campaign_num(b"c_2000"), Some(2000));
+        assert_eq!(canonical_campaign_num(b"c_01"), None);
+        assert_eq!(canonical_campaign_num(b"C_1"), None);
+        assert_eq!(canonical_campaign_num(b"c_"), None);
+        assert_eq!(canonical_campaign_num(b" c_1"), None);
+        assert_eq!(canonical_campaign_num(b"c_1 "), None);
+        assert_eq!(canonical_campaign_num(b"c_1\r"), None);
+        assert_eq!(canonical_campaign_num(b"c_999"), Some(999));
     }
 }
